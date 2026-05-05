@@ -178,8 +178,8 @@ pub struct OllyApi {
 
 impl OllyApi {
     /// Create a new OllyApi client.
-    pub fn new(endpoint: &str, api_key: &str) -> Result<Self> {
-        let client = CxClient::new(endpoint, api_key)?;
+    pub fn new(endpoint: &str, api_key: &str, timeout: Option<u64>) -> Result<Self> {
+        let client = CxClient::new(endpoint, api_key, timeout)?;
         Ok(Self { client })
     }
 

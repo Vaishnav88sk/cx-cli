@@ -118,6 +118,10 @@ struct Cli {
     #[arg(long, global = true)]
     read_only: bool,
 
+    /// HTTP client timeout in seconds.
+    #[arg(long, global = true)]
+    timeout: Option<u64>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -2278,7 +2282,12 @@ async fn main() -> Result<()> {
     let temp_dir = global_config.temp_dir.clone();
 
     // Resolve one or more profiles into execution targets.
-    let configs = config::resolve_all(&cli.profile, cli.api_key.as_deref(), cli.region.as_deref())
+    let configs = config::resolve_all(
+        &cli.profile,
+        cli.api_key.as_deref(),
+        cli.region.as_deref(),
+        cli.timeout,
+    )
         .await
         .map_err(|e| {
             eprintln!("Configuration error: {e}");

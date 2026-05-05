@@ -313,6 +313,7 @@ pub struct ResolvedConfig {
     pub profile_name: String,
     pub api_key: String,
     pub endpoint: String,
+    pub timeout: Option<u64>,
 }
 
 /// Returns the cx config directory: `~/.cx/`
@@ -424,6 +425,7 @@ async fn resolve_single(
     profile_name: &str,
     api_key_override: Option<&str>,
     region_override: Option<&str>,
+    timeout: Option<u64>,
 ) -> Result<ResolvedConfig> {
     if !profile_file(profile_name)?.exists() {
         if let (Some(key), Some(region)) = (api_key_override, region_override) {
@@ -432,6 +434,7 @@ async fn resolve_single(
                 profile_name: profile_name.to_string(),
                 endpoint: region.api_endpoint().to_string(),
                 api_key: key.to_string(),
+                timeout,
             });
         }
     }
@@ -497,6 +500,7 @@ async fn resolve_single(
         profile_name: profile_name.to_string(),
         endpoint: profile.region.api_endpoint().to_string(),
         api_key: bearer,
+        timeout,
     })
 }
 
@@ -507,10 +511,11 @@ pub async fn resolve(
     profile_override: Option<&str>,
     api_key_override: Option<&str>,
     region_override: Option<&str>,
+    timeout: Option<u64>,
 ) -> Result<ResolvedConfig> {
     let config = load_config()?;
     let name = profile_override.unwrap_or(&config.default_profile);
-    resolve_single(name, api_key_override, region_override).await
+    resolve_single(name, api_key_override, region_override, timeout).await
 }
 
 /// Resolve one or more named profiles into a list of `ResolvedConfig` values.
@@ -522,16 +527,17 @@ pub async fn resolve_all(
     profiles: &[String],
     api_key_override: Option<&str>,
     region_override: Option<&str>,
+    timeout: Option<u64>,
 ) -> Result<Vec<ResolvedConfig>> {
     if profiles.is_empty() {
         let cfg = load_config()?;
         return Ok(vec![
-            resolve_single(&cfg.default_profile, api_key_override, region_override).await?,
+            resolve_single(&cfg.default_profile, api_key_override, region_override, timeout).await?,
         ]);
     }
     let mut results = Vec::with_capacity(profiles.len());
     for name in profiles {
-        results.push(resolve_single(name, api_key_override, region_override).await?);
+        results.push(resolve_single(name, api_key_override, region_override, timeout).await?);
     }
     Ok(results)
 }

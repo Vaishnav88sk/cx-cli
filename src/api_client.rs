@@ -12,7 +12,7 @@ pub struct CxClient {
 }
 
 impl CxClient {
-    pub fn new(endpoint: impl Into<String>, api_key: &str) -> Result<Self> {
+    pub fn new(endpoint: impl Into<String>, api_key: &str, timeout: Option<u64>) -> Result<Self> {
         let mut headers = header::HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
@@ -24,10 +24,15 @@ impl CxClient {
             header::HeaderValue::from_static("application/json"),
         );
 
-        let inner = Client::builder()
+        let mut builder = Client::builder()
             .default_headers(headers)
-            .user_agent(concat!("cx-cli/", env!("CARGO_PKG_VERSION")))
-            .build()?;
+            .user_agent(concat!("cx-cli/", env!("CARGO_PKG_VERSION")));
+            
+        if let Some(t) = timeout {
+            builder = builder.timeout(std::time::Duration::from_secs(t));
+        }
+
+        let inner = builder.build()?;
 
         Ok(Self {
             inner,
