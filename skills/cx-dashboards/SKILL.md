@@ -49,6 +49,8 @@ Beyond creating dashboards, use these commands to manage existing ones:
 | `cx dashboards folders create --name "Name"` | Create a dashboard folder |
 | `cx dashboards folders create --name "Sub" --parent-id <id>` | Create a nested folder |
 | `cx dashboards replace --from-file dashboard.json` | Replace an existing dashboard with updated JSON |
+| `cx dashboards check --from-file dashboard.json` | Validate a dashboard definition without persisting (server-side strict check; exits non-zero on errors) |
+| `cx dashboards check <dashboard-id>` | Validate a stored dashboard by id |
 
 To update an existing dashboard:
 
@@ -80,11 +82,12 @@ Dashboard Progress:
 - [ ] Phase 4: Generate the Coralogix JSON
 - [ ] Phase 5: Live-verify every query through the cx CLI
 - [ ] Phase 6: Self-verify structure against the checklist
-- [ ] Phase 7: Deploy via `cx dashboards create`
-- [ ] Phase 8: Share the dashboard link with the user
+- [ ] Phase 7: Server-side validation via `cx dashboards check`
+- [ ] Phase 8: Deploy via `cx dashboards create`
+- [ ] Phase 9: Share the dashboard link with the user
 ```
 
-Proceed in order. Don't jump to Phase 4 before the user approves the Phase 3 plan, and don't run Phase 7 before Phases 5 and 6 both pass. Phase 8 is mandatory — the workflow is not done until the user has a clickable link.
+Proceed in order. Don't jump to Phase 4 before the user approves the Phase 3 plan, and don't run Phase 8 before Phases 5–7 all pass. Phase 9 is mandatory — the workflow is not done until the user has a clickable link.
 
 ---
 
@@ -199,7 +202,7 @@ For query syntax follow [`references/query-syntax.md`](references/query-syntax.m
 
 ## Phase 5: Live-verify every query through the cx CLI
 
-Every PromQL and DataPrime query in the draft has to successfully run through `cx` before Phase 7. This catches invented metric names, typoed field paths, and malformed pipelines.
+Every PromQL and DataPrime query in the draft has to successfully run through `cx` before Phase 8. This catches invented metric names, typoed field paths, and malformed pipelines.
 
 ### Frequent vs Archive (what / when / where in JSON)
 
@@ -252,7 +255,19 @@ Run this checklist against the final JSON. Fix and re-check if any item fails be
 
 ---
 
-## Phase 7: Deploy via `cx dashboards create`
+## Phase 7: Server-side validation via `cx dashboards check`
+
+Phase 6 caught structural issues by hand. This phase runs the whole dashboard through the Coralogix Dashboard Service's strict validator (`CheckDashboard`) — the same validation `create`/`replace` apply on write, plus a superset that compiles every PromQL/DataPrime query and enforces required ids for variables and filters.
+
+1. Run `cx dashboards check --from-file /tmp/cx-dashboard-<slug>.json`.
+2. If the command exits non-zero, the output lists issues with `severity`, `location` (an RFC 6901 JSON Pointer into the dashboard, e.g. `/sections/0/rows/1/widgets/2`), and `message`. Fix each issue in the JSON (loop back to Phase 4), re-run Phase 5 for any query that changed, then re-run this phase.
+3. When `check` exits 0 (text output: `Dashboard is valid (no issues)`), proceed to Phase 8.
+
+`check` is read-only — it never persists the dashboard. Warnings (`SEVERITY_WARNING`) print but do not fail the gate; only errors (`SEVERITY_ERROR`) cause a non-zero exit. In multi-profile fan-out, any profile returning errors fails the command.
+
+---
+
+## Phase 8: Deploy via `cx dashboards create`
 
 Don't tell the user to paste JSON into the Coralogix UI - deploy it directly.
 
@@ -266,17 +281,19 @@ On failure: show the CLI error verbatim and return to Phase 5. The most common c
 
 ---
 
-## Phase 8: Share the dashboard link
+## Phase 9: Share the dashboard link
 
 The workflow is **not done** until the user has a clickable link to the dashboard. Printing the ID alone forces the user to navigate the Coralogix UI by hand, which defeats the point of automating deployment.
 
-After Phase 7 succeeds, capture the dashboard `id` returned by `cx dashboards create`, build the URL using the region → webapp host mapping in [`references/deploy.md`](references/deploy.md) § "Share the link", and emit the output template below. Render the dashboard **name** as the link text — that's what the user clicks.
+After Phase 8 succeeds, capture the `View in Coralogix: <url>` line that `cx dashboards create` prints to stderr (see [`references/deploy.md`](references/deploy.md) § "Share the link" for when it's omitted) and emit the output template below. Render the dashboard **name** as the link text — that's what the user clicks.
+
+Linking to a dashboard found via `cx dashboards catalog` (rather than one you just created) works differently: `catalog` prints only one link, to the catalog page, not a per-dashboard link. To link to one specific dashboard from that list, build `<base>/dashboards/<dashboard_id>`, where `<base>` is the console URL already seen in a `View in Coralogix: <base>/...` line printed by any `cx dashboards` command this session — never fabricate `<base>` yourself, and never invent it if no such line has been printed yet.
 
 ---
 
 ## Output format for the user
 
-When the webapp host is resolvable (any built-in region, or a `Custom` endpoint that follows the `api.<host>` convention):
+When `cx dashboards create` printed a `View in Coralogix:` link:
 
 ````
 ## Plan
@@ -287,17 +304,17 @@ When the webapp host is resolvable (any built-in region, or a `Custom` endpoint 
 - DataPrime queries verified: <N>/<N>
 
 ## Deployed
-- Dashboard: **[<Name>](https://<region>.app.coralogix.com/#/dashboards/<id>)**
+- Dashboard: **[<Name>](<url from the View in Coralogix line>)**
 - ID: `<id>`
 - Folder: `<folder name or "root">`
 - Profile: `<cx profile>`
 
-Open it: [<Name>](https://<region>.app.coralogix.com/#/dashboards/<id>)
+Open it: [<Name>](<url from the View in Coralogix line>)
 
 Adjust filter values (e.g. `account_id`) after opening it.
 ````
 
-When the webapp host **cannot** be derived (custom endpoint that doesn't match `api.<host>`), omit the link entirely — do not invent a URL. Use this template instead:
+When `cx dashboards create` did **not** print a `View in Coralogix:` line (no console link could be resolved for the profile and no `console_url` override configured), omit the link entirely — do not invent a URL. Use this template instead:
 
 ````
 ## Plan

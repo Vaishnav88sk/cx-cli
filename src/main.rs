@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use clap::parser::ValueSource;
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use clap_complete::aot::Shell;
 use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
@@ -29,6 +29,22 @@ fn complete_profile_names(current: &OsStr) -> Vec<CompletionCandidate> {
         .filter(|name| name.starts_with(prefix))
         .map(CompletionCandidate::new)
         .collect()
+}
+
+/// Value parser for `cx init --install-completions <shell>`. Restricts the
+/// choice to the shells the guided flow can install to a known default path
+/// (zsh, bash, fish); other shells need an explicit path, available via the
+/// interactive picker's "Other" option or `cx completions install --path`.
+fn parse_completions_shell(value: &str) -> Result<Shell, String> {
+    match value {
+        "zsh" => Ok(Shell::Zsh),
+        "bash" => Ok(Shell::Bash),
+        "fish" => Ok(Shell::Fish),
+        other => Err(format!(
+            "unsupported shell '{other}' (choose zsh, bash, or fish; \
+             for other shells use `cx completions install <shell> --path ...`)"
+        )),
+    }
 }
 
 /// How `search-fields` searches: by semantic description or by value content.
@@ -70,6 +86,11 @@ pub enum SearchByValueDataset {
   \x1b[1mdashboards\x1b[0m         Manage dashboards and dashboard folders
   \x1b[1mviews\x1b[0m              Manage saved views and view folders
   \x1b[1mslos\x1b[0m               Manage SLO definitions
+  \x1b[1minfra\x1b[0m              Query infrastructure resources and their data
+  \x1b[1mservice-catalog\x1b[0m    Query service-catalog entities and their RED/health/saturation data
+
+\x1b[1m\x1b[4mAI:\x1b[0m
+  \x1b[1mai-center\x1b[0m (risky)  Manage AI Center applications, evaluations, policies, and pricing
 
 \x1b[1m\x1b[4mDetect & Respond:\x1b[0m
   \x1b[1malerts\x1b[0m             Manage alert definitions and suppression rules
@@ -102,7 +123,9 @@ pub enum SearchByValueDataset {
   \x1b[1molly\x1b[0m               Interact with the AI assistant
 
 \x1b[1m\x1b[4mLocal:\x1b[0m
+  \x1b[1minit\x1b[0m               One-step onboarding: configure a profile and install the agent skills
   \x1b[1mprofiles\x1b[0m           Manage profiles (list, add, delete, set-default)
+  \x1b[1mskills\x1b[0m             Install or update the cx agent skills for coding agents
   \x1b[1mcleanup\x1b[0m            Remove stale temp files"
 )]
 struct Cli {
@@ -136,7 +159,16 @@ struct Cli {
     )]
     region: Option<String>,
 
-    /// Output format: text, json, or agents. Overrides the default set in config.
+    /// HTTP request timeout in seconds.
+    #[arg(
+        long = "http-timeout",
+        global = true,
+        env = "CX_HTTP_TIMEOUT",
+        help_heading = "Global Options"
+    )]
+    http_timeout: Option<u64>,
+
+    /// Output format: text, json, or toon. Overrides the default set in config.
     #[arg(long, short = 'o', global = true, help_heading = "Global Options")]
     output: Option<OutputFormat>,
 
@@ -147,6 +179,10 @@ struct Cli {
     /// Block all write operations. Useful for safe agent/automation access.
     #[arg(long, global = true, help_heading = "Global Options")]
     read_only: bool,
+
+    /// Suppress "View in Coralogix" console links (stderr line).
+    #[arg(long, global = true, help_heading = "Global Options")]
+    no_console_link: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -211,8 +247,99 @@ Examples:
 }
 
 #[derive(Subcommand)]
+enum SkillsCmd {
+    /// Install or update the cx agent skills bundle via the `skills` npx installer.
+    ///
+    /// By default this asks one question (install scope) and then runs the
+    /// installer fully non-interactively with agent auto-detection. Re-running
+    /// updates already-installed skills to the latest published bundle.
+    /// Requires Node.js (npx).
+    #[command(after_help = "\
+Examples:
+  cx skills install                     # asks global vs local, then installs
+  cx skills install --global            # no questions asked (also updates in place)
+  cx skills install --local --agent claude-code
+  cx skills install --interactive       # walk the installer's full flow")]
+    Install {
+        /// Install skills globally (~/), available in every project.
+        #[arg(long, conflicts_with_all = ["local", "interactive"])]
+        global: bool,
+
+        /// Install skills locally (./), for this project only.
+        #[arg(long, conflicts_with = "interactive")]
+        local: bool,
+
+        /// Target specific agents (passed through to the installer's -a;
+        /// overrides its auto-detection). Repeatable.
+        #[arg(long = "agent", value_name = "NAME", conflicts_with = "interactive")]
+        agents: Vec<String>,
+
+        /// Walk the skills installer's full interactive flow (skill/agent
+        /// selection, scope, install method) instead of the default
+        /// non-interactive install.
+        #[arg(long)]
+        interactive: bool,
+    },
+}
+
+#[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
+    /// One-step onboarding: configure a profile and install the cx agent skills.
+    ///
+    /// Interactive by default (OAuth browser login); pass `--api-key` (or set
+    /// CX_API_KEY) to authenticate with an API key instead. With `--url` and
+    /// an API key the profile step is prompt-free; add `--global-skills`/
+    /// `--local-skills` (or `--no-skills`) to also answer the skills-scope
+    /// question and get a fully
+    /// prompt-free run for CI and coding agents — without a scope flag, a run
+    /// with no terminal skips the skills install with a warning. `--oauth`
+    /// works without a terminal too: the sign-in URL is printed for you (or an
+    /// agent's user) to approve in a browser, then the command waits for the
+    /// approval — handy when no API key is on hand, but because it needs a
+    /// browser it is not suited to fully headless CI (use `--api-key` there).
+    /// Idempotent: if a profile already exists the profile step is skipped
+    /// (reconfigure with `cx profiles add --force`).
+    #[command(after_help = "\
+Examples:
+  cx init                                              # interactive walkthrough
+  cx init --url https://myteam.app.eu2.coralogix.com --api-key $CX_API_KEY --global-skills
+  cx init --oauth --url https://myteam.app.eu2.coralogix.com
+  cx init --no-skills                                  # skip the agent-skills install")]
+    Init {
+        /// Coralogix URL to derive the region from (e.g. your browser URL).
+        /// Unrecognized URLs are used as a custom API endpoint (BYOC / private link).
+        #[arg(long)]
+        url: Option<String>,
+        /// Force OAuth browser login, ignoring any supplied API key
+        /// (--api-key / CX_API_KEY). Without a key, OAuth is used anyway.
+        /// No terminal required: the sign-in URL is printed and the command
+        /// waits while it is approved in a browser, so an agent can onboard
+        /// with OAuth by surfacing the URL to its user.
+        #[arg(long)]
+        oauth: bool,
+        /// Skip the agent-skills install step (installed by default).
+        #[arg(long, conflicts_with_all = ["global_skills", "local_skills", "agents"])]
+        no_skills: bool,
+        /// Install skills globally (~/), available in every project.
+        #[arg(long, conflicts_with = "local_skills")]
+        global_skills: bool,
+        /// Install skills locally (./), for this project only.
+        #[arg(long)]
+        local_skills: bool,
+        /// Target specific agents for the skills install (passed through to the
+        /// installer's -a; overrides its auto-detection). Repeatable.
+        #[arg(long = "agent", value_name = "NAME")]
+        agents: Vec<String>,
+        /// Install shell completions for the given shell (zsh, bash, or fish)
+        /// without prompting. Omit to be asked interactively (a picker with a
+        /// "don't install" default); a non-interactive run then skips the step.
+        /// Ignored when completions are already installed - use
+        /// `cx completions install <shell>` to add a shell or reinstall.
+        #[arg(long, value_name = "SHELL", value_parser = parse_completions_shell)]
+        install_completions: Option<Shell>,
+    },
+
     /// Manage profiles (list, add, delete, set-default).
     Profiles {
         #[command(subcommand)]
@@ -227,6 +354,15 @@ enum Commands {
 
     /// Remove stale cx_results* files (older than 30 minutes) from the temp directory.
     Cleanup,
+
+    /// Install or update the cx agent skills for coding agents (Claude Code, Cursor, Codex, ...).
+    ///
+    /// Re-run `cx skills install` anytime to update already-installed skills
+    /// to the latest published bundle.
+    Skills {
+        #[command(subcommand)]
+        cmd: SkillsCmd,
+    },
 
     /// Query logs using DataPrime syntax.
     #[command(after_help = "\
@@ -339,7 +475,9 @@ Examples:
   cx usage summary
   cx usage daily --type processed-gbs
   cx usage logs-count
-  cx usage spans-count --start now-24h --end now"
+  cx usage spans-count --start now-24h --end now
+  cx usage capabilities
+  cx usage query --from-file query.json"
     )]
     DataUsage {
         #[command(subcommand)]
@@ -493,6 +631,22 @@ Examples:
         cmd: DataArchiveCmd,
     },
 
+    /// Manage AI Center (GenAI) applications, evaluations, policies, and pricing.
+    #[command(
+        name = "ai-center",
+        after_help = "\
+Examples:
+  cx ai-center applications list
+  cx ai-center evaluations list --application <app> --subsystem <sub>
+  cx ai-center coverage
+  cx ai-center custom-evaluations list
+  cx ai-center model-pricing get"
+    )]
+    AiCenter {
+        #[command(subcommand)]
+        cmd: AiCenterCmd,
+    },
+
     /// Manage SLO definitions.
     #[command(after_help = "\
 Examples:
@@ -504,6 +658,30 @@ Examples:
     Slos {
         #[command(subcommand)]
         cmd: SlosCmd,
+    },
+
+    /// Query infrastructure resources and their data.
+    #[command(after_help = "\
+Examples:
+  cx infra resources types
+  cx infra resources list --category Hosts --type EC2_Instances")]
+    Infra {
+        #[command(subcommand)]
+        cmd: InfraCmd,
+    },
+
+    /// Query service-catalog v2 entities: RED metrics, health, resource
+    /// saturation (k8s-pod/jvm), and dependency columns.
+    #[command(after_help = "\
+Examples:
+  cx service-catalog entity-types
+  cx service-catalog schema service
+  cx service-catalog entities service
+  cx service-catalog data service --start now-1h --end now --column latency_p99
+  cx service-catalog entity-data service checkout --start now-1h --end now --column latency_p99")]
+    ServiceCatalog {
+        #[command(subcommand)]
+        cmd: ServiceCatalogCmd,
     },
 
     /// Search log/span fields by description or by value content.
@@ -564,7 +742,10 @@ Examples:
 
 impl Commands {
     fn is_risky(&self) -> bool {
-        matches!(self, Self::Iam { .. } | Self::DataArchive { .. })
+        matches!(
+            self,
+            Self::Iam { .. } | Self::DataArchive { .. } | Self::AiCenter { .. }
+        )
     }
 
     fn is_olly(&self) -> bool {
@@ -579,14 +760,56 @@ impl Commands {
 enum ProfilesCmd {
     /// List all configured profiles.
     List,
-    /// Add or reconfigure a profile interactively.
+    /// Add or reconfigure a profile.
+    ///
+    /// Values supplied via flags/env are never prompted for. On a terminal,
+    /// missing values are prompted interactively. Without a terminal (or when
+    /// both an API key and a region/URL are supplied), nothing is prompted:
+    /// missing required values are errors, and existing profiles are only
+    /// overwritten with --force.
+    #[command(after_help = "\
+Examples:
+  cx profiles add                                        # fully interactive
+  cx profiles add prod --region eu2                      # region answered, rest prompted
+  cx profiles add --oauth --region eu2                   # straight to browser login
+  cx profiles add --url https://myteam.app.eu2.coralogix.com --api-key $KEY
+  CX_API_KEY=$KEY cx profiles add --region us1 --force   # non-interactive overwrite")]
     Add {
-        /// Profile name to configure (prompted if not provided).
+        /// Profile name to configure (prompted if not provided; defaults to
+        /// "default" when running non-interactively).
         #[arg(add = ArgValueCompleter::new(complete_profile_names))]
         name: Option<String>,
+        /// Profile name to configure (alternative to the positional NAME).
+        /// Named --name to stay clear of the global --profile selector.
+        #[arg(long = "name", conflicts_with = "name", value_name = "NAME")]
+        name_flag: Option<String>,
+        /// Coralogix URL to derive the region from (e.g. your browser URL).
+        /// Unrecognized URLs are used as a custom API endpoint (BYOC / private link).
+        #[arg(long, conflicts_with = "region")]
+        url: Option<String>,
+        /// Region short-name (us1, us2, us3, eu1, eu2, ap1, ap2, ap3). Alternative to --url.
+        #[arg(long)]
+        region: Option<String>,
+        /// API key (Team Key or Personal Key). Also read from CX_API_KEY.
+        #[arg(long, env = "CX_API_KEY", hide_env_values = true, value_name = "KEY")]
+        api_key: Option<String>,
+        /// Use OAuth browser login, skipping the auth-method prompt. Takes
+        /// precedence over --api-key / CX_API_KEY. Prints the sign-in URL, so
+        /// it also works without a terminal (requires --url or --region there).
+        #[arg(long)]
+        oauth: bool,
+        /// Overwrite an existing profile without prompting.
+        #[arg(long)]
+        force: bool,
         /// Set this profile as the default without prompting.
         #[arg(long)]
         set_default: bool,
+        /// When creating the first profile, disable the Olly AI assistant
+        /// (`cx olly ask`). Olly is enabled by default; this opts out. Only
+        /// affects first-profile setup, where the global Olly setting is
+        /// written. No prompt either way.
+        #[arg(long)]
+        disable_olly: bool,
     },
     /// Delete a profile and its stored credentials.
     Delete {
@@ -695,7 +918,8 @@ enum OllyCmd {
 Examples:
   cx olly ask \"What alerts fired today?\"
   cx olly ask \"Show me error logs\" --chat-id <uuid>
-  cx olly ask \"Analyze this\" --model claude-sonnet-4-5")]
+  cx olly ask \"Analyze this\" --model claude-sonnet-4-5
+  cx olly ask \"Find error logs that start with 'Cart Not Found' in the last 6 hours\" --agent-to-agent-mode")]
     Ask {
         /// The message to send to the assistant.
         message: String,
@@ -708,9 +932,16 @@ Examples:
         #[arg(long, default_value = "gpt-5.2")]
         model: String,
 
-        /// Timeout in seconds for response.
+        /// Maximum seconds to wait for an Olly response.
         #[arg(long, default_value_t = 900)]
         timeout: u32,
+
+        /// Ask Olly as a sub-agent (agent-to-agent mode): shorter responses, no
+        /// charts/tables, asks clarifying questions instead of guessing.
+        /// Defaults to false (human-facing); pass this flag if you're an
+        /// LLM/agent calling `cx` to opt into shorter, sub-agent-style responses.
+        #[arg(long)]
+        agent_to_agent_mode: bool,
     },
 
     /// Manage artifacts from assistant responses.
@@ -845,6 +1076,28 @@ Examples:
         /// is generated automatically.
         #[arg(long, default_value = "-")]
         from_file: String,
+    },
+    /// Validate a dashboard definition without persisting it (CheckDashboard).
+    ///
+    /// Read-only. Exits non-zero if any error-severity issue is found (CI gate).
+    /// In multi-profile fan-out, any profile returning error-severity issues
+    /// causes a non-zero exit, even if other profiles are clean.
+    #[command(after_help = "\
+Examples:
+  cx dashboards check --from-file dash.json
+  cx dashboards check --from-file -            # read from stdin
+  cx dashboards check 01234abcd                 # validate a stored dashboard by id
+  cx -p prod -p staging dashboards check 01234abcd   # multi-profile")]
+    Check {
+        /// Path to a JSON file with the dashboard definition. Use '-' for stdin.
+        /// Accepts either a bare dashboard document or a `{\"dashboard\": {...}}` wrapper.
+        /// Mutually exclusive with <DASHBOARD_ID>.
+        #[arg(long, conflicts_with = "dashboard_id")]
+        from_file: Option<String>,
+
+        /// Validate an existing dashboard by id. Mutually exclusive with --from-file.
+        #[arg(conflicts_with = "from_file")]
+        dashboard_id: Option<String>,
     },
     /// Delete a dashboard [requires --yes].
     Delete {
@@ -1385,6 +1638,34 @@ Output:
         #[arg(long = "param")]
         params: Vec<String>,
     },
+    /// Show the labels, measurements, and limits supported by the Data Usage Query API.
+    Capabilities,
+    /// Query billable data usage using a capabilities-derived JSON request.
+    #[command(
+        group(
+            ArgGroup::new("query_input")
+                .required(true)
+                .args(["from_file", "query"])
+        ),
+        after_help = "\
+Workflow:
+  1. Run `cx usage capabilities -o json`.
+  2. Build a request using only the returned labels, measurements, and limits.
+
+Examples:
+  cx usage query --from-file query.json
+  cx usage query --query '{\"daily\":{\"relativeRange\":\"DAILY_RELATIVE_RANGE_LAST_7_DAYS\"}}'
+  cat query.json | cx usage query --from-file -"
+    )]
+    Query {
+        /// Path to a JSON query request. Use '-' for stdin. Mutually exclusive with --query.
+        #[arg(long, conflicts_with = "query")]
+        from_file: Option<String>,
+
+        /// Inline JSON query request. Mutually exclusive with --from-file.
+        #[arg(long, conflicts_with = "from_file")]
+        query: Option<String>,
+    },
     /// Show export status.
     ExportStatus,
 }
@@ -1670,6 +1951,9 @@ enum IntegrationsCmd {
     },
     /// Test an integration configuration.
     Test {
+        /// Deployed integration ID. Required unless the JSON contains integrationId and integrationData.
+        #[arg(long)]
+        id: Option<String>,
         /// Path to JSON file. Use '-' for stdin.
         #[arg(long, default_value = "-")]
         from_file: String,
@@ -1878,6 +2162,174 @@ enum ViewFoldersCmd {
     Delete {
         /// Folder ID.
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AiCenterCmd {
+    /// Manage AI applications (inventory + guarded status).
+    #[command(after_help = "\
+Examples:
+  cx ai-center applications list
+  cx ai-center applications get <application-id>")]
+    Applications {
+        #[command(subcommand)]
+        cmd: ApplicationsCmd,
+    },
+    /// Manage configured evaluations/policies on applications.
+    #[command(after_help = "\
+Examples:
+  cx ai-center evaluations list --application <app> --subsystem <sub>
+  cx ai-center evaluations get <evaluation-id>
+  cx ai-center evaluations create --from-file eval.json
+  cx ai-center evaluations update <evaluation-id> --from-file eval.json
+  cx ai-center evaluations delete <evaluation-id>")]
+    Evaluations {
+        #[command(subcommand)]
+        cmd: EvaluationsCmd,
+    },
+    /// Manage custom evaluation policies and their application links.
+    #[command(after_help = "\
+Examples:
+  cx ai-center custom-evaluations list
+  cx ai-center custom-evaluations list-for-application <application-id>
+  cx ai-center custom-evaluations create --from-file policy.json
+  cx ai-center custom-evaluations add <evaluation-id> <application-id>
+  cx ai-center custom-evaluations remove <evaluation-id> <application-id>")]
+    CustomEvaluations {
+        #[command(subcommand)]
+        cmd: CustomEvaluationsCmd,
+    },
+    /// Show evaluation coverage — AI applications per evaluation type.
+    Coverage,
+    /// View and set the team's custom model-pricing overrides.
+    #[command(after_help = "\
+Examples:
+  cx ai-center model-pricing get
+  cx ai-center model-pricing set --from-file pricing.json")]
+    ModelPricing {
+        #[command(subcommand)]
+        cmd: ModelPricingCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApplicationsCmd {
+    /// List AI applications (incl. guarded status).
+    List {
+        /// Maximum number of applications to return.
+        #[arg(long)]
+        page_size: Option<u32>,
+        /// Number of applications to skip for pagination.
+        #[arg(long)]
+        page_offset: Option<u32>,
+        /// Filter to apps using this evaluation type, as the API enum (e.g. PII,
+        /// TOXICITY, PROMPT_INJECTION — the keys from `coverage`). Repeatable.
+        #[arg(long = "evaluation-type")]
+        evaluation_type: Vec<String>,
+    },
+    /// Get one AI application by UUID.
+    Get {
+        /// Application UUID.
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum EvaluationsCmd {
+    /// List configured evaluations (optionally scoped to one app).
+    List {
+        /// Scope to one application (pair with --subsystem).
+        #[arg(long)]
+        application: Option<String>,
+        /// Scope to one subsystem (pair with --application).
+        #[arg(long)]
+        subsystem: Option<String>,
+        /// Filter by evaluation type, as the API enum (e.g. PII, TOXICITY,
+        /// PROMPT_INJECTION — the keys returned by `coverage`).
+        #[arg(long = "evaluation-type")]
+        evaluation_type: Option<String>,
+        /// Maximum number of evaluations to return.
+        #[arg(long)]
+        page_size: Option<u32>,
+        /// Number of evaluations to skip for pagination.
+        #[arg(long)]
+        page_offset: Option<u32>,
+    },
+    /// Get one configured evaluation by UUID.
+    Get {
+        /// Evaluation UUID.
+        id: String,
+    },
+    /// Create (enable) an evaluation on an application from a JSON file [requires --yes].
+    Create {
+        /// Path to JSON file with the evaluation body. Use '-' for stdin.
+        #[arg(long, default_value = "-")]
+        from_file: String,
+    },
+    /// Update a configured evaluation by UUID from a JSON file [requires --yes].
+    Update {
+        /// Path to JSON file with the partial update. Use '-' for stdin.
+        #[arg(long, default_value = "-")]
+        from_file: String,
+        /// Evaluation UUID.
+        id: String,
+    },
+    /// Delete a configured evaluation by UUID [requires --yes].
+    Delete {
+        /// Evaluation UUID.
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CustomEvaluationsCmd {
+    /// List all custom evaluation policies.
+    List,
+    /// List custom evaluations linked to an application (by UUID).
+    ListForApplication {
+        /// Application UUID.
+        application_id: String,
+    },
+    /// Create a custom evaluation policy from a JSON file [requires --yes].
+    Create {
+        /// Path to JSON file with the custom evaluation body. Use '-' for stdin.
+        #[arg(long, default_value = "-")]
+        from_file: String,
+    },
+    /// Update a custom evaluation policy by UUID from a JSON file [requires --yes].
+    Update {
+        /// Path to JSON file with the partial update. Use '-' for stdin.
+        #[arg(long, default_value = "-")]
+        from_file: String,
+        /// Custom evaluation UUID.
+        id: String,
+    },
+    /// Attach a custom evaluation (policy) to an application [requires --yes].
+    Add {
+        /// Custom evaluation UUID.
+        evaluation_id: String,
+        /// Application UUID.
+        application_id: String,
+    },
+    /// Detach a custom evaluation (policy) from an application [requires --yes].
+    Remove {
+        /// Custom evaluation UUID.
+        evaluation_id: String,
+        /// Application UUID.
+        application_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelPricingCmd {
+    /// Get the team's custom per-model pricing overrides.
+    Get,
+    /// Set the team's per-model pricing overrides from a JSON file [requires --yes].
+    Set {
+        /// Path to JSON file with the model→price map. Use '-' for stdin.
+        #[arg(long, default_value = "-")]
+        from_file: String,
     },
 }
 
@@ -2306,6 +2758,191 @@ Examples:
     },
 }
 
+#[derive(Subcommand)]
+enum InfraCmd {
+    /// Query infrastructure resources.
+    #[command(after_help = "\
+Examples:
+  cx infra resources types
+  cx infra resources list --category Hosts --type EC2_Instances --scope environment=prod
+  cx infra resources health-history \"1001234:host_id=i-abc123\"
+  cx infra resources raw-data \"1001234:host_id=i-abc123\"")]
+    Resources {
+        #[command(subcommand)]
+        cmd: InfraResourcesCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum InfraResourcesCmd {
+    /// List the available resource types (category/type pairs).
+    Types,
+    /// List resources of a given category and type.
+    #[command(after_help = "\
+Examples:
+  cx infra resources list --category Hosts --type EC2_Instances
+  cx infra resources list --category Hosts --type EC2_Instances --name-filter web
+  cx infra resources list --category Hosts --type EC2_Instances --scope service=checkout --scope environment=prod
+  cx infra resources list --category Hosts --type EC2_Instances --start-row 100 --end-row 200")]
+    List {
+        /// Resource category (discover with `cx infra resources types`).
+        #[arg(long)]
+        category: String,
+
+        /// Resource type within the category (discover with `cx infra resources types`).
+        #[arg(long)]
+        r#type: String,
+
+        /// Filter resources by name.
+        #[arg(long)]
+        name_filter: Option<String>,
+
+        /// Scope filter as key=value; repeatable across different keys, at most
+        /// once per key. Keys: service, environment, team. Multiple keys AND together.
+        #[arg(long)]
+        scope: Vec<String>,
+
+        /// First row of the page window (0-based; default 0).
+        #[arg(long)]
+        start_row: Option<i64>,
+
+        /// Row after the last one of the page window, exclusive (default:
+        /// start-row + 100). The API rejects windows reaching past row 10,000.
+        #[arg(long)]
+        end_row: Option<i64>,
+    },
+    /// Show the daily health status history for a resource.
+    #[command(after_help = "\
+Examples:
+  cx infra resources health-history \"1001234:host_id=i-abc123\"")]
+    HealthHistory {
+        /// Resource ID, exactly as returned by `cx infra resources list`.
+        resource_id: String,
+    },
+    /// Fetch the raw resource document as JSON.
+    #[command(after_help = "\
+Examples:
+  cx infra resources raw-data \"1001234:host_id=i-abc123\"
+  cx infra resources raw-data \"1001234:host_id=i-abc123\" -o json")]
+    RawData {
+        /// Resource ID, exactly as returned by `cx infra resources list`.
+        resource_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCatalogCmd {
+    /// List the entity types this account has service-catalog data for.
+    EntityTypes,
+    /// Show the columns/labels schema for one entity type.
+    #[command(after_help = "\
+Examples:
+  cx service-catalog schema service
+  cx service-catalog schema k8s-pod")]
+    Schema {
+        /// Entity type: service, database, operation, database-operation, jvm,
+        /// jvm-gc, k8s-pod, or transaction (also accepts the full
+        /// ENTITY_TYPE_* proto name).
+        entity_type: String,
+    },
+    /// List the known entities (e.g. service names) of one entity type.
+    #[command(after_help = "\
+Examples:
+  cx service-catalog entities service")]
+    Entities {
+        /// Entity type (see `schema` for accepted values).
+        entity_type: String,
+    },
+    /// Get column data (RED metrics, health, resource saturation, dependencies)
+    /// across every entity of one type.
+    #[command(after_help = "\
+Examples:
+  cx service-catalog data service --start now-1h --end now --column latency_p99 --column error_rate
+  cx service-catalog data k8s-pod --start now-1h --end now --column cpu_usage --column oom_killed
+  cx service-catalog data service --start now-1h --end now --column latency_p99 \\
+    --filter environment=prod --aggregation table --sort-column latency_p99 --sort-order desc --limit 10
+  cx service-catalog data service --start now-1h --end now --column latency_p99 --aggregation timeseries")]
+    Data {
+        /// Entity type (see `schema` for accepted values).
+        entity_type: String,
+
+        /// Start of the time range: `now`, `now-1h`, `now - 3d`, or ISO-8601.
+        #[arg(long)]
+        start: String,
+
+        /// End of the time range: `now`, `now-1h`, `now - 3d`, or ISO-8601.
+        #[arg(long)]
+        end: String,
+
+        /// Column id to fetch. Repeatable; at least one required. Discover
+        /// valid ids with `cx service-catalog schema <entity-type>`.
+        #[arg(long = "column", required = true)]
+        columns: Vec<String>,
+
+        /// Label to group rows by, on top of the entity identity. Repeatable.
+        #[arg(long = "group-by")]
+        group_by: Vec<String>,
+
+        /// Filter as label=value1,value2; repeatable across different labels,
+        /// at most once per label. Multiple labels combine with AND.
+        #[arg(long = "filter")]
+        filters: Vec<String>,
+
+        /// Response shape: `table` (default) or `timeseries`.
+        #[arg(long, default_value = "table")]
+        aggregation: String,
+
+        /// Max rows to return. `table` aggregation only.
+        #[arg(long)]
+        limit: Option<i32>,
+
+        /// Column id to sort by. `table` aggregation only.
+        #[arg(long)]
+        sort_column: Option<String>,
+
+        /// Sort direction: `asc` or `desc`. `table` aggregation only.
+        #[arg(long)]
+        sort_order: Option<String>,
+    },
+    /// Get column data for exactly one named entity (drilldown).
+    #[command(after_help = "\
+Examples:
+  cx service-catalog entity-data service checkout --start now-1h --end now --column latency_p99")]
+    EntityData {
+        /// Entity type (see `schema` for accepted values).
+        entity_type: String,
+
+        /// Entity id, exactly as returned by `cx service-catalog entities`.
+        entity_id: String,
+
+        /// Start of the time range: `now`, `now-1h`, `now - 3d`, or ISO-8601.
+        #[arg(long)]
+        start: String,
+
+        /// End of the time range: `now`, `now-1h`, `now - 3d`, or ISO-8601.
+        #[arg(long)]
+        end: String,
+
+        /// Column id to fetch. Repeatable; at least one required. Discover
+        /// valid ids with `cx service-catalog schema <entity-type>`.
+        #[arg(long = "column", required = true)]
+        columns: Vec<String>,
+
+        /// Label to group rows by, on top of the entity identity. Repeatable.
+        #[arg(long = "group-by")]
+        group_by: Vec<String>,
+
+        /// Filter as label=value1,value2; repeatable across different labels,
+        /// at most once per label. Multiple labels combine with AND.
+        #[arg(long = "filter")]
+        filters: Vec<String>,
+
+        /// Response shape: `table` (default) or `timeseries`.
+        #[arg(long, default_value = "table")]
+        aggregation: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Handle shell completions before any stdout output.
@@ -2327,12 +2964,34 @@ async fn main() -> Result<()> {
     // Check if this is a profiles command - use separate parser without global API flags.
     // Only works when `profiles` is the first arg (no global flags before it).
     if std::env::args().nth(1).as_deref() == Some("profiles") {
-        let profiles_cli = ProfilesCli::parse();
+        let profile_matches = ProfilesCli::command().get_matches();
+        let profiles_cli = ProfilesCli::from_arg_matches(&profile_matches)?;
         let ProfilesTopLevel::Profiles { cmd } = profiles_cli.command;
         let result = match cmd {
             ProfilesCmd::List => commands::profiles::run_list(),
-            ProfilesCmd::Add { name, set_default } => {
-                commands::profiles::run_add(name, set_default).await
+            ProfilesCmd::Add {
+                name,
+                name_flag,
+                url,
+                region,
+                api_key,
+                oauth,
+                force,
+                set_default,
+                disable_olly,
+            } => {
+                commands::profiles::run_add(commands::profiles::AddArgs {
+                    name: name.or(name_flag),
+                    url,
+                    region,
+                    api_key,
+                    oauth,
+                    force,
+                    set_default,
+                    disable_olly,
+                    quick: false,
+                })
+                .await
             }
             ProfilesCmd::Delete { name, force } => commands::profiles::run_delete(name, force),
             ProfilesCmd::SetDefault { name } => commands::profiles::run_set_default(name),
@@ -2352,17 +3011,25 @@ async fn main() -> Result<()> {
 
     let matches = cmd.get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
-
+    let yes = cli.yes;
     // Load global config early for read-only / risky / olly gating.
     let global_cfg_early = config::load_config().unwrap_or_default();
 
     let read_only =
         cli.read_only || safety::env_is_truthy("CX_READ_ONLY") || global_cfg_early.read_only;
+    let no_console_link = cli.no_console_link
+        || safety::env_is_truthy("CX_NO_CONSOLE_LINK")
+        || global_cfg_early.no_console_link;
     if read_only {
         let top = safety::get_top_level_subcommand_name(&matches);
         let is_local = matches!(
             top.as_deref(),
-            Some("profiles") | Some("cleanup") | Some("completions") | Some("docs")
+            Some("profiles")
+                | Some("cleanup")
+                | Some("completions")
+                | Some("docs")
+                | Some("skills")
+                | Some("init")
         );
         if !is_local {
             if let Some(leaf) = safety::get_leaf_subcommand_name(&matches) {
@@ -2397,8 +3064,29 @@ async fn main() -> Result<()> {
     if let Commands::Profiles { cmd } = cli.command {
         let result = match cmd {
             ProfilesCmd::List => commands::profiles::run_list(),
-            ProfilesCmd::Add { name, set_default } => {
-                commands::profiles::run_add(name, set_default).await
+            ProfilesCmd::Add {
+                name,
+                name_flag,
+                url,
+                region,
+                api_key,
+                oauth,
+                force,
+                set_default,
+                disable_olly,
+            } => {
+                commands::profiles::run_add(commands::profiles::AddArgs {
+                    name: name.or(name_flag),
+                    url,
+                    region,
+                    api_key,
+                    oauth,
+                    force,
+                    set_default,
+                    disable_olly,
+                    quick: false,
+                })
+                .await
             }
             ProfilesCmd::Delete { name, force } => commands::profiles::run_delete(name, force),
             ProfilesCmd::SetDefault { name } => commands::profiles::run_set_default(name),
@@ -2428,9 +3116,75 @@ async fn main() -> Result<()> {
         return result;
     }
 
+    // Init chains profile setup + skills install locally - no API credentials
+    // up front (the profile step acquires them). Handled before credential
+    // resolution, like profiles/skills.
+    if let Commands::Init {
+        url,
+        oauth,
+        no_skills,
+        global_skills,
+        local_skills,
+        agents,
+        install_completions,
+    } = cli.command
+    {
+        let scope = if global_skills {
+            Some(commands::skills::SkillsScope::Global)
+        } else if local_skills {
+            Some(commands::skills::SkillsScope::Local)
+        } else {
+            None
+        };
+        let result = commands::init::run_init(commands::init::InitArgs {
+            url,
+            region: cli.region,
+            api_key: cli.api_key,
+            oauth,
+            install_skills: !no_skills,
+            agents,
+            scope,
+            install_completions,
+        })
+        .await;
+        update_check::maybe_print_notice(OutputFormat::Text);
+        return result;
+    }
+
+    // Skills install shells out to npx locally - no API credentials.
+    if let Commands::Skills { cmd } = cli.command {
+        let SkillsCmd::Install {
+            global,
+            local,
+            agents,
+            interactive,
+        } = cmd;
+        let result = if interactive {
+            commands::skills::run_advanced_install()
+        } else {
+            let scope = if global {
+                Some(commands::skills::SkillsScope::Global)
+            } else if local {
+                Some(commands::skills::SkillsScope::Local)
+            } else {
+                None
+            };
+            // The explicit command always (re)installs to update, so the
+            // outcome is uninteresting here — only init branches on it.
+            commands::skills::run_install(commands::skills::InstallOptions {
+                scope,
+                agents,
+                skip_if_installed: false,
+            })
+            .map(|_| ())
+        };
+        update_check::maybe_print_notice(OutputFormat::Text);
+        return result;
+    }
+
     // Schema command doesn't need API credentials - outputs command tree as JSON.
-    // The _meta.update block is already embedded in the JSON output for agents;
-    // the stderr notice covers TTY human users (or plain text for agents mode).
+    // The _meta.update block is already embedded in the JSON output for toon mode;
+    // the stderr notice covers TTY human users (or plain text for toon mode).
     if let Commands::Schema = cli.command {
         let result = commands::schema::run(Cli::command());
         let output = cli.output.unwrap_or(OutputFormat::Text);
@@ -2445,7 +3199,7 @@ async fn main() -> Result<()> {
                 commands::completions::run_generate(shell, &mut Cli::command())
             }
             CompletionsCmd::Install { shell, path } => {
-                commands::completions::run_install(shell, path, &mut Cli::command())
+                commands::completions::run_install(shell, path)
             }
             CompletionsCmd::Refresh => commands::completions::run_refresh(Cli::command),
         };
@@ -2509,16 +3263,39 @@ async fn main() -> Result<()> {
     let temp_dir = global_config.temp_dir.clone();
 
     // Resolve one or more profiles into execution targets.
-    let configs = config::resolve_all(&cli.profile, effective_api_key, effective_region)
-        .await
-        .map_err(|e| {
-            eprintln!("Configuration error: {e}");
+    let configs = match config::resolve_all(&cli.profile, effective_api_key, effective_region).await
+    {
+        Ok(configs) => configs,
+        Err(error) => {
+            // First-run guidance: when nothing is configured at all (no profile
+            // on disk and no env-only credentials), don't dump the underlying
+            // config-resolution error. Point the user at the single guided entry
+            // point instead. The onboarding commands that *fix* this state
+            // (`cx init`, `cx profiles add`, `cx skills`) are handled earlier and
+            // never reach here, so they can't be short-circuited by this branch.
+            if config::list_profile_names()
+                .map(|names| names.is_empty())
+                .unwrap_or(false)
+            {
+                eprintln!("No Coralogix profile is configured.");
+                eprintln!("Run `cx init` to set up a profile and get started.");
+                // Exit here instead of returning the error: propagating it
+                // would dump the anyhow config-resolution chain (with a second,
+                // contradicting `cx profiles add` instruction) after the
+                // guidance. The two lines above are the entire first-run story.
+                std::process::exit(1);
+            }
+            eprintln!("Configuration error: {error}");
             eprintln!("Run `cx profiles add` to set up credentials.");
-            e
-        })?;
+            return Err(error);
+        }
+    };
 
-    let targets = build_targets(configs)?;
-    let yes = cli.yes;
+    let targets = build_targets(
+        configs,
+        no_console_link,
+        cli.http_timeout.map(std::time::Duration::from_secs),
+    )?;
     let agent_mode = safety::is_agent_mode();
 
     // Wrap the dispatch in an async block so we can capture its Result and
@@ -2526,7 +3303,9 @@ async fn main() -> Result<()> {
     let cmd_result = async {
         match cli.command {
             Commands::Profiles { .. } => unreachable!("handled by ProfilesCli above"),
+            Commands::Init { .. } => unreachable!("handled above"),
             Commands::Cleanup => unreachable!("handled above"),
+            Commands::Skills { .. } => unreachable!("handled above"),
             Commands::Schema => unreachable!("handled above"),
             Commands::Completions { .. } => unreachable!("handled above"),
             Commands::Docs { .. } => unreachable!("handled above"),
@@ -2635,6 +3414,18 @@ async fn main() -> Result<()> {
                 DashboardsCmd::Replace { from_file } => {
                     commands::dashboards::run_replace(
                         &targets, &from_file, output, yes, agent_mode,
+                    )
+                    .await?;
+                }
+                DashboardsCmd::Check {
+                    from_file,
+                    dashboard_id,
+                } => {
+                    commands::dashboards::run_check(
+                        &targets,
+                        from_file.as_deref(),
+                        dashboard_id.as_deref(),
+                        output,
                     )
                     .await?;
                 }
@@ -3038,6 +3829,18 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                 }
+                DataUsageCmd::Capabilities => {
+                    commands::data_usage::run_capabilities(&targets, output).await?;
+                }
+                DataUsageCmd::Query { from_file, query } => {
+                    commands::data_usage::run_query(
+                        &targets,
+                        from_file.as_deref(),
+                        query.as_deref(),
+                        output,
+                    )
+                    .await?;
+                }
                 DataUsageCmd::ExportStatus => {
                     commands::data_usage::run_export_status(&targets, output).await?;
                 }
@@ -3264,9 +4067,15 @@ async fn main() -> Result<()> {
                     confirm_destructive(&format!("Delete integration '{id}'?"), yes, agent_mode)?;
                     commands::integrations::run_delete(&targets, &id).await?;
                 }
-                IntegrationsCmd::Test { from_file } => {
+                IntegrationsCmd::Test { id, from_file } => {
                     confirm_destructive("Test integration?", yes, agent_mode)?;
-                    commands::integrations::run_test(&targets, &from_file, output).await?;
+                    commands::integrations::run_test(
+                        &targets,
+                        id.as_deref(),
+                        &from_file,
+                        output,
+                    )
+                    .await?;
                 }
                 IntegrationsCmd::Template => {
                     commands::integrations::run_template(&targets, output).await?;
@@ -3445,6 +4254,156 @@ async fn main() -> Result<()> {
                 },
             },
 
+            Commands::AiCenter { cmd } => match cmd {
+                AiCenterCmd::Applications { cmd } => match cmd {
+                    ApplicationsCmd::List {
+                        page_size,
+                        page_offset,
+                        evaluation_type,
+                    } => {
+                        commands::ai_center::run_applications_list(
+                            &targets,
+                            page_size,
+                            page_offset,
+                            &evaluation_type,
+                            output,
+                        )
+                        .await?;
+                    }
+                    ApplicationsCmd::Get { id } => {
+                        commands::ai_center::run_applications_get(&targets, &id, output).await?;
+                    }
+                },
+                AiCenterCmd::Evaluations { cmd } => match cmd {
+                    EvaluationsCmd::List {
+                        application,
+                        subsystem,
+                        evaluation_type,
+                        page_size,
+                        page_offset,
+                    } => {
+                        commands::ai_center::run_evaluations_list(
+                            &targets,
+                            application.as_deref(),
+                            subsystem.as_deref(),
+                            evaluation_type.as_deref(),
+                            page_size,
+                            page_offset,
+                            output,
+                        )
+                        .await?;
+                    }
+                    EvaluationsCmd::Get { id } => {
+                        commands::ai_center::run_evaluations_get(&targets, &id, output).await?;
+                    }
+                    EvaluationsCmd::Create { from_file } => {
+                        confirm_destructive("Create a new AI evaluation?", yes, agent_mode)?;
+                        commands::ai_center::run_evaluations_create(&targets, &from_file, output)
+                            .await?;
+                    }
+                    EvaluationsCmd::Update { from_file, id } => {
+                        confirm_destructive(
+                            &format!("Update AI evaluation '{id}'?"),
+                            yes,
+                            agent_mode,
+                        )?;
+                        commands::ai_center::run_evaluations_update(
+                            &targets, &id, &from_file, output,
+                        )
+                        .await?;
+                    }
+                    EvaluationsCmd::Delete { id } => {
+                        confirm_destructive(
+                            &format!("Delete AI evaluation '{id}'?"),
+                            yes,
+                            agent_mode,
+                        )?;
+                        commands::ai_center::run_evaluations_delete(&targets, &id, output).await?;
+                    }
+                },
+                AiCenterCmd::CustomEvaluations { cmd } => match cmd {
+                    CustomEvaluationsCmd::List => {
+                        commands::ai_center::run_custom_evaluations_list(&targets, output).await?;
+                    }
+                    CustomEvaluationsCmd::ListForApplication { application_id } => {
+                        commands::ai_center::run_custom_evaluations_for_application(
+                            &targets,
+                            &application_id,
+                            output,
+                        )
+                        .await?;
+                    }
+                    CustomEvaluationsCmd::Create { from_file } => {
+                        confirm_destructive("Create a new custom evaluation?", yes, agent_mode)?;
+                        commands::ai_center::run_custom_evaluations_create(
+                            &targets, &from_file, output,
+                        )
+                        .await?;
+                    }
+                    CustomEvaluationsCmd::Update { from_file, id } => {
+                        confirm_destructive(
+                            &format!("Update custom evaluation '{id}'?"),
+                            yes,
+                            agent_mode,
+                        )?;
+                        commands::ai_center::run_custom_evaluations_update(
+                            &targets, &id, &from_file, output,
+                        )
+                        .await?;
+                    }
+                    CustomEvaluationsCmd::Add {
+                        evaluation_id,
+                        application_id,
+                    } => {
+                        confirm_destructive(
+                            &format!(
+                                "Attach policy '{evaluation_id}' to application '{application_id}'?"
+                            ),
+                            yes,
+                            agent_mode,
+                        )?;
+                        commands::ai_center::run_add_policy(
+                            &targets,
+                            &evaluation_id,
+                            &application_id,
+                            output,
+                        )
+                        .await?;
+                    }
+                    CustomEvaluationsCmd::Remove {
+                        evaluation_id,
+                        application_id,
+                    } => {
+                        confirm_destructive(
+                            &format!(
+                                "Detach policy '{evaluation_id}' from application '{application_id}'?"
+                            ),
+                            yes,
+                            agent_mode,
+                        )?;
+                        commands::ai_center::run_remove_policy(
+                            &targets,
+                            &evaluation_id,
+                            &application_id,
+                            output,
+                        )
+                        .await?;
+                    }
+                },
+                AiCenterCmd::Coverage => {
+                    commands::ai_center::run_coverage(&targets, output).await?;
+                }
+                AiCenterCmd::ModelPricing { cmd } => match cmd {
+                    ModelPricingCmd::Get => {
+                        commands::ai_center::run_model_pricing_get(&targets, output).await?;
+                    }
+                    ModelPricingCmd::Set { from_file } => {
+                        confirm_destructive("Set team model pricing?", yes, agent_mode)?;
+                        commands::ai_center::run_model_pricing_set(&targets, &from_file, output)
+                            .await?;
+                    }
+                },
+            },
             Commands::Iam { cmd } => match cmd {
                 IamCmd::ApiKeys { cmd } => match cmd {
                     ApiKeysCmd::List => {
@@ -3693,6 +4652,106 @@ async fn main() -> Result<()> {
                 }
             },
 
+            Commands::Infra { cmd } => match cmd {
+                InfraCmd::Resources { cmd } => match cmd {
+                    InfraResourcesCmd::Types => {
+                        commands::infra::run_types(&targets, output).await?;
+                    }
+                    InfraResourcesCmd::List {
+                        category,
+                        r#type,
+                        name_filter,
+                        scope,
+                        start_row,
+                        end_row,
+                    } => {
+                        commands::infra::run_list(
+                            &targets,
+                            &category,
+                            &r#type,
+                            name_filter.as_deref(),
+                            &scope,
+                            start_row,
+                            end_row,
+                            output,
+                        )
+                        .await?;
+                    }
+                    InfraResourcesCmd::HealthHistory { resource_id } => {
+                        commands::infra::run_health_history(&targets, &resource_id, output)
+                            .await?;
+                    }
+                    InfraResourcesCmd::RawData { resource_id } => {
+                        commands::infra::run_raw_data(&targets, &resource_id, output).await?;
+                    }
+                },
+            },
+
+            Commands::ServiceCatalog { cmd } => match cmd {
+                ServiceCatalogCmd::EntityTypes => {
+                    commands::service_catalog::run_entity_types(&targets, output).await?;
+                }
+                ServiceCatalogCmd::Schema { entity_type } => {
+                    commands::service_catalog::run_schema(&targets, &entity_type, output).await?;
+                }
+                ServiceCatalogCmd::Entities { entity_type } => {
+                    commands::service_catalog::run_entities(&targets, &entity_type, output)
+                        .await?;
+                }
+                ServiceCatalogCmd::Data {
+                    entity_type,
+                    start,
+                    end,
+                    columns,
+                    group_by,
+                    filters,
+                    aggregation,
+                    limit,
+                    sort_column,
+                    sort_order,
+                } => {
+                    commands::service_catalog::run_data(
+                        &targets,
+                        &entity_type,
+                        &start,
+                        &end,
+                        &columns,
+                        &group_by,
+                        &filters,
+                        &aggregation,
+                        limit,
+                        sort_column.as_deref(),
+                        sort_order.as_deref(),
+                        output,
+                    )
+                    .await?;
+                }
+                ServiceCatalogCmd::EntityData {
+                    entity_type,
+                    entity_id,
+                    start,
+                    end,
+                    columns,
+                    group_by,
+                    filters,
+                    aggregation,
+                } => {
+                    commands::service_catalog::run_entity_data(
+                        &targets,
+                        &entity_type,
+                        &entity_id,
+                        &start,
+                        &end,
+                        &columns,
+                        &group_by,
+                        &filters,
+                        &aggregation,
+                        output,
+                    )
+                    .await?;
+                }
+            },
+
             Commands::SearchFields {
                 text,
                 search_type,
@@ -3735,6 +4794,7 @@ async fn main() -> Result<()> {
                     chat_id,
                     model,
                     timeout,
+                    agent_to_agent_mode,
                 } => {
                     commands::olly::run_ask(
                         &targets,
@@ -3742,6 +4802,7 @@ async fn main() -> Result<()> {
                         chat_id.as_deref(),
                         &model,
                         timeout,
+                        agent_to_agent_mode,
                         output,
                     )
                     .await?;
@@ -3770,11 +4831,48 @@ async fn main() -> Result<()> {
     // Print update notice after command output so it doesn't scroll off.
     // Using a separate result variable (rather than ?) ensures the notice
     // fires even when the command returns an error — same behaviour as `gh`.
-    if output == OutputFormat::Agents {
-        update_check::maybe_print_agents_meta();
+    if output == OutputFormat::Toon {
+        update_check::maybe_print_toon_meta();
     } else {
         update_check::maybe_print_notice(output);
     }
 
     cmd_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_completions_shell_accepts_supported_shells() {
+        assert_eq!(parse_completions_shell("zsh").unwrap(), Shell::Zsh);
+        assert_eq!(parse_completions_shell("bash").unwrap(), Shell::Bash);
+        assert_eq!(parse_completions_shell("fish").unwrap(), Shell::Fish);
+    }
+
+    #[test]
+    fn parse_completions_shell_rejects_elvish() {
+        // Elvish is a valid clap_complete Shell variant but cx has no adapter
+        // for it, so the `cx init --install-completions` flag must reject it
+        // up front rather than fail later at registration time.
+        let err = parse_completions_shell("elvish").unwrap_err();
+        assert!(err.contains("elvish"), "error should name the bad shell");
+        assert!(
+            err.contains("zsh") && err.contains("bash") && err.contains("fish"),
+            "error should list the supported shells"
+        );
+    }
+
+    #[test]
+    fn parse_completions_shell_rejects_powershell_without_path() {
+        // PowerShell has no default install path, so it isn't offered by the
+        // flag (the interactive picker's "Other" + explicit path covers it).
+        assert!(parse_completions_shell("powershell").is_err());
+    }
+
+    #[test]
+    fn parse_completions_shell_rejects_garbage() {
+        assert!(parse_completions_shell("not-a-shell").is_err());
+    }
 }

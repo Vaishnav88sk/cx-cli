@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use toon_format::encode_default as toon_encode;
 
 use crate::config::OutputFormat;
-use crate::execution::{fan_out, ExecutionTarget};
+use crate::execution::{fan_out, report_errors_and_collect_successes, ExecutionTarget};
 use crate::render;
 use api::{Preset, PresetsApi};
 
@@ -18,7 +18,7 @@ fn preset_to_json(preset: &Preset, include_profile: bool, profile: &str) -> Valu
         "name": preset.display_name(),
         "connector_type": preset.display_connector_type(),
         "is_default": preset.is_default,
-        "is_custom": preset.is_custom,
+        "is_custom": preset.display_is_custom(),
     });
     if include_profile {
         if let Value::Object(ref mut m) = v {
@@ -45,6 +45,13 @@ fn read_from_file(path: &str) -> Result<Value> {
     Ok(serde_json::from_str(&raw)?)
 }
 
+fn custom_preset_request_body(body: Value) -> Value {
+    match body {
+        Value::Object(ref map) if map.contains_key("preset") => body,
+        _ => json!({ "preset": body }),
+    }
+}
+
 pub async fn run_list(targets: &[Arc<ExecutionTarget>], output: OutputFormat) -> Result<()> {
     eprintln!("{}", "Fetching presets...".dimmed());
     let include_profile = targets.len() > 1;
@@ -57,22 +64,17 @@ pub async fn run_list(targets: &[Arc<ExecutionTarget>], output: OutputFormat) ->
 
     let mut all_json: Vec<Value> = Vec::new();
     let mut all_items: Vec<(String, Preset)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                for preset in resp.presets {
-                    all_json.push(preset_to_json(&preset, include_profile, &profile));
-                    all_items.push((profile.clone(), preset));
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        for preset in resp.presets {
+            all_json.push(preset_to_json(&preset, include_profile, &profile));
+            all_items.push((profile.clone(), preset));
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json(&all_json)?,
         OutputFormat::Yaml => render::render_yaml(&all_json)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon =
                 toon_encode(&all_json).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -91,7 +93,7 @@ pub async fn run_list(targets: &[Arc<ExecutionTarget>], output: OutputFormat) ->
                         preset.display_name().to_string(),
                         preset.display_connector_type(),
                         render::bool_display(preset.is_default),
-                        render::bool_display(preset.is_custom),
+                        render::bool_display(preset.display_is_custom()),
                     ]
                 })
                 .collect();
@@ -122,21 +124,16 @@ pub async fn run_get(
     })
     .await;
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut val) => {
-                if include_profile {
-                    render::tag_get_result(&mut val, &profile);
-                }
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, mut val) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut val, &profile);
         }
+        all_results.push(val);
     }
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -158,7 +155,7 @@ pub async fn run_create(
     from_file: &str,
     output: OutputFormat,
 ) -> Result<()> {
-    let body = read_from_file(from_file)?;
+    let body = custom_preset_request_body(read_from_file(from_file)?);
     eprintln!("{}", "Creating preset...".dimmed());
     let include_profile = targets.len() > 1;
     let per_profile = fan_out(targets, |t| {
@@ -170,28 +167,23 @@ pub async fn run_create(
     })
     .await;
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                if let Some(preset) = resp.preset {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "Created preset '{}' in profile '{profile}'.",
-                            preset.display_name()
-                        )
-                        .green()
-                    );
-                    all_results.push(preset_to_json(&preset, include_profile, &profile));
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        if let Some(preset) = resp.preset {
+            eprintln!(
+                "{}",
+                format!(
+                    "Created preset '{}' in profile '{profile}'.",
+                    preset.display_name()
+                )
+                .green()
+            );
+            all_results.push(preset_to_json(&preset, include_profile, &profile));
         }
     }
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -206,7 +198,7 @@ pub async fn run_update(
     from_file: &str,
     output: OutputFormat,
 ) -> Result<()> {
-    let body = read_from_file(from_file)?;
+    let body = custom_preset_request_body(read_from_file(from_file)?);
     eprintln!("{}", "Updating preset...".dimmed());
     let per_profile = fan_out(targets, |t| {
         let body = body.clone();
@@ -217,22 +209,17 @@ pub async fn run_update(
     })
     .await;
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(val) => {
-                eprintln!(
-                    "{}",
-                    format!("Updated preset in profile '{profile}'.").green()
-                );
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, val) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!("Updated preset in profile '{profile}'.").green()
+        );
+        all_results.push(val);
     }
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -254,14 +241,11 @@ pub async fn run_delete(targets: &[Arc<ExecutionTarget>], id: &str) -> Result<()
         }
     })
     .await;
-    for (profile, result) in per_profile {
-        match result {
-            Ok(()) => eprintln!(
-                "{}",
-                format!("Preset {id} deleted in profile '{profile}'.").green()
-            ),
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, ()) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!("Preset {id} deleted in profile '{profile}'.").green()
+        );
     }
     Ok(())
 }
@@ -278,14 +262,11 @@ pub async fn run_set_default(targets: &[Arc<ExecutionTarget>], id: &str) -> Resu
         }
     })
     .await;
-    for (profile, result) in per_profile {
-        match result {
-            Ok(()) => eprintln!(
-                "{}",
-                format!("Preset {id} set as default in profile '{profile}'.").green()
-            ),
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, ()) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!("Preset {id} set as default in profile '{profile}'.").green()
+        );
     }
     Ok(())
 }

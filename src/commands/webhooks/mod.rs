@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use toon_format::encode_default as toon_encode;
 
 use crate::config::OutputFormat;
-use crate::execution::{fan_out, ExecutionTarget};
+use crate::execution::{fan_out, report_errors_and_collect_successes, ExecutionTarget};
 use crate::render;
 use api::{Webhook, WebhooksApi};
 
@@ -26,6 +26,32 @@ fn webhook_to_json(webhook: &Webhook, include_profile: bool, profile: &str) -> V
         }
     }
     v
+}
+
+/// Extract a webhook ID from a create response, trying the shapes the API
+/// has been observed to return: nested `webhook.id`, or a bare top-level
+/// `id`. IDs may come back as a JSON string or number. Returns `None` when
+/// the response carried no ID so callers can flag that rather than
+/// fabricate one.
+fn webhook_id_from_response(resp: &Value) -> Option<String> {
+    fn at(v: &Value, pointer: &str) -> Option<String> {
+        match v.pointer(pointer)? {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }
+    }
+    at(resp, "/webhook/id").or_else(|| at(resp, "/id"))
+}
+
+/// Pull the display name out of a create *request* body. The create response
+/// only carries an id, so the name has to come from what was sent. Outgoing
+/// webhook payloads nest it under `data` (`{"data": {"name": ...}}`); the
+/// root `name` fallback covers hand-written flat payloads.
+fn webhook_name_from_request(body: &Value) -> Option<&str> {
+    body.pointer("/data/name")
+        .or_else(|| body.get("name"))
+        .and_then(|v| v.as_str())
 }
 
 fn read_from_file(path: &str) -> Result<Value> {
@@ -57,22 +83,26 @@ pub async fn run_list(targets: &[Arc<ExecutionTarget>], output: OutputFormat) ->
 
     let mut all_json: Vec<Value> = Vec::new();
     let mut all_items: Vec<(String, Webhook)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                for webhook in resp.webhooks {
-                    all_json.push(webhook_to_json(&webhook, include_profile, &profile));
-                    all_items.push((profile.clone(), webhook));
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        // Print the outbound-webhooks page link to stderr once per profile.
+        // Skip when there are no webhooks, since there's nothing to view.
+        if !resp.deployed.is_empty() {
+            crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                crate::console_url::webhooks_url(b)
+            })
+            .await;
+        }
+        for webhook in resp.deployed {
+            let webhook_json = webhook_to_json(&webhook, include_profile, &profile);
+            all_json.push(webhook_json);
+            all_items.push((profile.clone(), webhook));
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json(&all_json)?,
         OutputFormat::Yaml => render::render_yaml(&all_json)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon =
                 toon_encode(&all_json).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -124,22 +154,21 @@ pub async fn run_get(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut val) => {
-                if include_profile {
-                    render::tag_get_result(&mut val, &profile);
-                }
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, mut val) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut val, &profile);
         }
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::webhooks_url(b)
+        })
+        .await;
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -162,6 +191,9 @@ pub async fn run_create(
     output: OutputFormat,
 ) -> Result<()> {
     let body = read_from_file(from_file)?;
+    let name = webhook_name_from_request(&body)
+        .unwrap_or("<unnamed>")
+        .to_string();
     eprintln!("{}", "Creating webhook...".dimmed());
     let include_profile = targets.len() > 1;
 
@@ -175,28 +207,35 @@ pub async fn run_create(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                if let Some(webhook) = resp.webhook {
-                    let name = webhook.name.clone().unwrap_or_default();
-                    let id = webhook.id.as_deref().unwrap_or("unknown");
-                    eprintln!(
-                        "{}",
-                        format!("Created webhook '{name}' (ID: {id}) in profile '{profile}'.")
-                            .green()
-                    );
-                    all_results.push(webhook_to_json(&webhook, include_profile, &profile));
-                }
+    for (profile, mut resp) in report_errors_and_collect_successes(per_profile)? {
+        let created_id = webhook_id_from_response(&resp);
+        render::print_created(
+            "Created",
+            "webhook",
+            Some(&name),
+            created_id.as_deref(),
+            &profile,
+        );
+        if include_profile {
+            // Create output uses the public `profile` key (list/create
+            // convention, see render.rs), not the get-only `_profile` hint.
+            if let Value::Object(ref mut m) = resp {
+                m.insert("profile".to_string(), Value::String(profile.to_string()));
             }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
         }
+        crate::execution::emit_console_link_for_profile(
+            targets,
+            &profile,
+            crate::console_url::webhooks_url,
+        )
+        .await;
+        all_results.push(resp);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -227,23 +266,22 @@ pub async fn run_update(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(val) => {
-                eprintln!(
-                    "{}",
-                    format!("Updated webhook {id} in profile '{profile}'.").green()
-                );
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, val) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!("Updated webhook {id} in profile '{profile}'.").green()
+        );
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::webhooks_url(b)
+        })
+        .await;
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -265,14 +303,15 @@ pub async fn run_delete(targets: &[Arc<ExecutionTarget>], id: &str) -> Result<()
         }
     })
     .await;
-    for (profile, result) in per_profile {
-        match result {
-            Ok(()) => eprintln!(
-                "{}",
-                format!("Webhook {id} deleted in profile '{profile}'.").green()
-            ),
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, ()) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!("Webhook {id} deleted in profile '{profile}'.").green()
+        );
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::webhooks_url(b)
+        })
+        .await;
     }
     Ok(())
 }
@@ -295,23 +334,22 @@ pub async fn run_test(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(val) => {
-                eprintln!(
-                    "{}",
-                    format!("Test completed in profile '{profile}'.").green()
-                );
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, val) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!("Test completed in profile '{profile}'.").green()
+        );
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::webhooks_url(b)
+        })
+        .await;
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -336,22 +374,21 @@ pub async fn run_types(targets: &[Arc<ExecutionTarget>], output: OutputFormat) -
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut val) => {
-                if include_profile {
-                    render::tag_get_result(&mut val, &profile);
-                }
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, mut val) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut val, &profile);
         }
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::webhooks_url(b)
+        })
+        .await;
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -363,4 +400,61 @@ pub async fn run_types(targets: &[Arc<ExecutionTarget>], output: OutputFormat) -
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn webhook_id_from_response_reads_wrapped_shape() {
+        let resp = json!({ "webhook": { "id": "wh-001", "name": "Slack Notify" } });
+        assert_eq!(webhook_id_from_response(&resp).as_deref(), Some("wh-001"));
+    }
+
+    #[test]
+    fn webhook_id_from_response_reads_bare_shape() {
+        // What the live API actually returns: the created webhook directly,
+        // with no `webhook` envelope.
+        let resp = json!({ "id": "wh-002", "name": "Slack Notify" });
+        assert_eq!(webhook_id_from_response(&resp).as_deref(), Some("wh-002"));
+    }
+
+    #[test]
+    fn webhook_id_from_response_reads_numeric_id() {
+        let resp = json!({ "webhook": { "id": 7 } });
+        assert_eq!(webhook_id_from_response(&resp).as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn webhook_id_from_response_none_when_id_absent() {
+        let resp = json!({});
+        assert_eq!(webhook_id_from_response(&resp), None);
+    }
+
+    #[test]
+    fn webhook_name_from_request_reads_nested_data_name() {
+        // The real outgoing-webhook create payload shape.
+        let body = json!({ "data": { "name": "Slack Notify", "type": "slack" } });
+        assert_eq!(webhook_name_from_request(&body), Some("Slack Notify"));
+    }
+
+    #[test]
+    fn webhook_name_from_request_falls_back_to_root_name() {
+        let body = json!({ "name": "Flat Payload" });
+        assert_eq!(webhook_name_from_request(&body), Some("Flat Payload"));
+    }
+
+    #[test]
+    fn webhook_name_from_request_prefers_data_name_over_root() {
+        let body = json!({ "name": "outer", "data": { "name": "inner" } });
+        assert_eq!(webhook_name_from_request(&body), Some("inner"));
+    }
+
+    #[test]
+    fn webhook_name_from_request_none_when_absent() {
+        assert_eq!(webhook_name_from_request(&json!({})), None);
+        // A non-string name is not a usable display name either.
+        assert_eq!(webhook_name_from_request(&json!({ "name": 7 })), None);
+    }
 }

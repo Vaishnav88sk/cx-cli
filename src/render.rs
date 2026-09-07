@@ -1,13 +1,14 @@
 //! Shared rendering helpers for command output.
 //!
-//! Provides functions for the three output modes (Text, JSON, Agents) so that
+//! Provides functions for the three output modes (Text, JSON, Toon) so that
 //! individual commands can delegate formatting without duplicating boilerplate.
 //!
 //! ## Profile key convention
 //!
-//! List commands inject a `"profile"` key into JSON rows via `execution::tag_rows`.
-//! Get commands use `"_profile"` (underscore-prefixed) as a rendering hint that
-//! should not appear in user-facing JSON output - see [`tag_get_result`].
+//! List commands inject a `"profile"` key into JSON rows inline while merging
+//! `execution::report_errors_and_collect_successes` results. Get commands use `"_profile"`
+//! (underscore-prefixed) as a rendering hint that should not appear in
+//! user-facing JSON output - see [`tag_get_result`].
 
 use anyhow::Result;
 use colored::Colorize;
@@ -27,17 +28,17 @@ pub fn render_json(rows: &[Value]) -> Result<()> {
     Ok(())
 }
 
-/// Format merged result rows for agents output (TOON-encoded).
+/// Format merged result rows for toon output (TOON-encoded).
 ///
-/// See `docs/agents-output.md` — agents mode uses TOON, not pretty JSON.
-pub fn format_agents(rows: &[Value]) -> Result<String> {
+/// See `docs/toon-output.md` — toon mode uses TOON encoding, not pretty JSON.
+pub fn format_toon(rows: &[Value]) -> Result<String> {
     let wrapped = Value::Array(rows.to_vec());
     toon_encode(&wrapped).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))
 }
 
-/// Print merged rows in agents (TOON) format.
-pub fn render_agents(rows: &[Value]) -> Result<()> {
-    println!("{}", format_agents(rows)?);
+/// Print merged rows in toon (TOON) format.
+pub fn render_toon(rows: &[Value]) -> Result<()> {
+    println!("{}", format_toon(rows)?);
     Ok(())
 }
 
@@ -98,6 +99,44 @@ pub fn bool_display(v: Option<bool>) -> String {
         Some(false) => "no".to_string(),
         None => "-".to_string(),
     }
+}
+
+/// Print a create/update success line to stderr.
+///
+/// Prints green with the ID when the API response included one. Otherwise
+/// prints a yellow warning rather than fabricating a placeholder ID - a
+/// missing ID from an otherwise-successful response is unusual enough to
+/// flag, not paper over.
+///
+/// `name` is `None` for resources that have no display name of their own
+/// (e.g. a bare integration or role ID).
+pub fn print_created(verb: &str, kind: &str, name: Option<&str>, id: Option<&str>, profile: &str) {
+    let subject = match name {
+        Some(name) => format!("{kind} '{name}'"),
+        None => kind.to_string(),
+    };
+    match id {
+        Some(id) => eprintln!(
+            "{}",
+            format!("{verb} {subject} (ID: {id}) in profile '{profile}'.").green()
+        ),
+        None => eprintln!(
+            "{}",
+            format!(
+                "{verb} {subject} in profile '{profile}', but the response did not include an ID."
+            )
+            .yellow()
+        ),
+    }
+}
+
+/// Print a "View in Coralogix" console link to stderr.
+///
+/// Callers only invoke this when a console base URL was successfully
+/// resolved (see `ExecutionTarget::console_base`) and an entity ID was
+/// extracted from the API response.
+pub fn print_console_link(url: &str) {
+    eprintln!("{}", format!("View in Coralogix: {url}").cyan());
 }
 
 // ── Text tables ──────────────────────────────────────────────────────────────
@@ -263,13 +302,13 @@ mod tests {
     }
 
     #[test]
-    fn format_agents_toon_differs_from_pretty_json() {
+    fn format_toon_differs_from_pretty_json() {
         let rows = vec![json!({"query_text": "q", "similarity": 0.5})];
         let json = format_json(&rows).unwrap();
-        let agents = format_agents(&rows).unwrap();
+        let toon = format_toon(&rows).unwrap();
         assert_ne!(
-            json, agents,
-            "agents output must be TOON, not identical to pretty JSON"
+            json, toon,
+            "toon output must be TOON-encoded, not identical to pretty JSON"
         );
     }
 

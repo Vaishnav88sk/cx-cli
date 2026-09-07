@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use toon_format::encode_default as toon_encode;
 
 use crate::config::OutputFormat;
-use crate::execution::{fan_out, ExecutionTarget};
+use crate::execution::{fan_out, report_errors_and_collect_successes, ExecutionTarget};
 use crate::render;
 use api::IpAccessApi;
 
@@ -40,22 +40,21 @@ pub async fn run_get(targets: &[Arc<ExecutionTarget>], output: OutputFormat) -> 
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut val) => {
-                if include_profile {
-                    render::tag_get_result(&mut val, &profile);
-                }
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, mut val) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut val, &profile);
         }
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::iam_ip_access_url(b)
+        })
+        .await;
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -90,31 +89,30 @@ pub async fn run_create(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                if let Some(settings) = resp.settings {
-                    let id = settings.display_id();
-                    eprintln!(
-                        "{}",
-                        format!("Created IP access settings (ID: {id}) in profile '{profile}'.")
-                            .green()
-                    );
-                    all_results.push(json!({
-                        "id": settings.id,
-                        "ip_access": settings.ip_access,
-                        "enable_coralogix_customer_support_access": settings.enable_coralogix_customer_support_access,
-                    }));
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        if let Some(settings) = resp.settings {
+            let id = settings.display_id();
+            eprintln!(
+                "{}",
+                format!("Created IP access settings (ID: {id}) in profile '{profile}'.").green()
+            );
+            let val = json!({
+                "id": settings.id,
+                "ip_access": settings.ip_access,
+                "enable_coralogix_customer_support_access": settings.enable_coralogix_customer_support_access,
+            });
+            crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                crate::console_url::iam_ip_access_url(b)
+            })
+            .await;
+            all_results.push(val);
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -142,29 +140,29 @@ pub async fn run_update(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                if let Some(settings) = resp.settings {
-                    eprintln!(
-                        "{}",
-                        format!("Updated IP access settings in profile '{profile}'.").green()
-                    );
-                    all_results.push(json!({
-                        "id": settings.id,
-                        "ip_access": settings.ip_access,
-                        "enable_coralogix_customer_support_access": settings.enable_coralogix_customer_support_access,
-                    }));
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        if let Some(settings) = resp.settings {
+            eprintln!(
+                "{}",
+                format!("Updated IP access settings in profile '{profile}'.").green()
+            );
+            let val = json!({
+                "id": settings.id,
+                "ip_access": settings.ip_access,
+                "enable_coralogix_customer_support_access": settings.enable_coralogix_customer_support_access,
+            });
+            crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                crate::console_url::iam_ip_access_url(b)
+            })
+            .await;
+            all_results.push(val);
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -182,14 +180,15 @@ pub async fn run_delete(targets: &[Arc<ExecutionTarget>]) -> Result<()> {
         Ok(())
     })
     .await;
-    for (profile, result) in per_profile {
-        match result {
-            Ok(()) => eprintln!(
-                "{}",
-                format!("IP access settings deleted in profile '{profile}'.").green()
-            ),
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, ()) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!("IP access settings deleted in profile '{profile}'.").green()
+        );
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::iam_ip_access_url(b)
+        })
+        .await;
     }
     Ok(())
 }

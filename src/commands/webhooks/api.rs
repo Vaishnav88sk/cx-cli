@@ -38,13 +38,7 @@ impl Webhook {
 #[serde(rename_all = "camelCase")]
 pub struct ListWebhooksResponse {
     #[serde(default)]
-    pub webhooks: Vec<Webhook>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateWebhookResponse {
-    pub webhook: Option<Webhook>,
+    pub deployed: Vec<Webhook>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,7 +67,11 @@ impl<'a> WebhooksApi<'a> {
         self.client.get(&path, &[]).await
     }
 
-    pub async fn create(&self, body: &Value) -> Result<CreateWebhookResponse> {
+    /// Returns the raw response, like `get`/`update` do. The API has been
+    /// observed to return the created webhook bare (`{"id": "..."}`) rather
+    /// than wrapped in a `{"webhook": {...}}` envelope, so callers must not
+    /// deserialize into a shape that assumes one specific wrapper.
+    pub async fn create(&self, body: &Value) -> Result<Value> {
         self.client.post(WEBHOOKS_BASE, body).await
     }
 
@@ -107,28 +105,21 @@ mod tests {
     #[test]
     fn deserialize_list_response() {
         let json = json!({
-            "webhooks": [
+            "deployed": [
                 { "id": "wh-001", "name": "Slack Notify", "type": "slack", "url": "https://hooks.slack.com/..." }
             ]
         });
         let resp: ListWebhooksResponse = serde_json::from_value(json).unwrap();
-        assert_eq!(resp.webhooks.len(), 1);
-        assert_eq!(resp.webhooks[0].display_name(), "Slack Notify");
-        assert_eq!(resp.webhooks[0].display_type(), "slack");
+        assert_eq!(resp.deployed.len(), 1);
+        assert_eq!(resp.deployed[0].display_name(), "Slack Notify");
+        assert_eq!(resp.deployed[0].display_type(), "slack");
     }
 
     #[test]
     fn deserialize_empty_list() {
-        let json = json!({ "webhooks": [] });
+        let json = json!({ "deployed": [] });
         let resp: ListWebhooksResponse = serde_json::from_value(json).unwrap();
-        assert!(resp.webhooks.is_empty());
-    }
-
-    #[test]
-    fn deserialize_create_response() {
-        let json = json!({ "webhook": { "id": "wh-001", "name": "Slack Notify" } });
-        let resp: CreateWebhookResponse = serde_json::from_value(json).unwrap();
-        assert_eq!(resp.webhook.unwrap().id.as_deref(), Some("wh-001"));
+        assert!(resp.deployed.is_empty());
     }
 
     #[test]

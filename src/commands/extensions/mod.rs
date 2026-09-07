@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use toon_format::encode_default as toon_encode;
 
 use crate::config::OutputFormat;
-use crate::execution::{fan_out, ExecutionTarget};
+use crate::execution::{fan_out, report_errors_and_collect_successes, ExecutionTarget};
 use crate::render;
 use api::{Extension, ExtensionsApi};
 
@@ -57,22 +57,27 @@ pub async fn run_list(targets: &[Arc<ExecutionTarget>], output: OutputFormat) ->
 
     let mut all_json: Vec<Value> = Vec::new();
     let mut all_items: Vec<(String, Extension)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                for ext in resp.extensions {
-                    all_json.push(extension_to_json(&ext, include_profile, &profile));
-                    all_items.push((profile.clone(), ext));
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        // Print the extensions/integrations page link to stderr once per
+        // profile. Skip when there are no extensions, since there's
+        // nothing to view.
+        if !resp.extensions.is_empty() {
+            crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                crate::console_url::integrations_url(b)
+            })
+            .await;
+        }
+        for ext in resp.extensions {
+            let val = extension_to_json(&ext, include_profile, &profile);
+            all_json.push(val);
+            all_items.push((profile.clone(), ext));
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json(&all_json)?,
         OutputFormat::Yaml => render::render_yaml(&all_json)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon =
                 toon_encode(&all_json).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -124,22 +129,21 @@ pub async fn run_get(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut val) => {
-                if include_profile {
-                    render::tag_get_result(&mut val, &profile);
-                }
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, mut val) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut val, &profile);
         }
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::integrations_url(b)
+        })
+        .await;
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -168,22 +172,27 @@ pub async fn run_deployed(targets: &[Arc<ExecutionTarget>], output: OutputFormat
 
     let mut all_json: Vec<Value> = Vec::new();
     let mut all_items: Vec<(String, Extension)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                for ext in resp.deployed_extensions {
-                    all_json.push(extension_to_json(&ext, include_profile, &profile));
-                    all_items.push((profile.clone(), ext));
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        // Print the extensions/integrations page link to stderr once per
+        // profile. Skip when there are no extensions, since there's
+        // nothing to view.
+        if !resp.deployed_extensions.is_empty() {
+            crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                crate::console_url::integrations_url(b)
+            })
+            .await;
+        }
+        for ext in resp.deployed_extensions {
+            let val = extension_to_json(&ext, include_profile, &profile);
+            all_json.push(val);
+            all_items.push((profile.clone(), ext));
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json(&all_json)?,
         OutputFormat::Yaml => render::render_yaml(&all_json)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon =
                 toon_encode(&all_json).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -234,23 +243,22 @@ pub async fn run_deploy(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(val) => {
-                eprintln!(
-                    "{}",
-                    format!("Extension deployed in profile '{profile}'.").green()
-                );
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, val) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!("Extension deployed in profile '{profile}'.").green()
+        );
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::integrations_url(b)
+        })
+        .await;
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -278,23 +286,22 @@ pub async fn run_update(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(val) => {
-                eprintln!(
-                    "{}",
-                    format!("Extension updated in profile '{profile}'.").green()
-                );
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, val) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!("Extension updated in profile '{profile}'.").green()
+        );
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::integrations_url(b)
+        })
+        .await;
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -322,23 +329,22 @@ pub async fn run_undeploy(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(val) => {
-                eprintln!(
-                    "{}",
-                    format!("Extension undeployed in profile '{profile}'.").green()
-                );
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, val) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!("Extension undeployed in profile '{profile}'.").green()
+        );
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::integrations_url(b)
+        })
+        .await;
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");

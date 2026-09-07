@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tabled::{Table, Tabled};
+use tabled::builder::Builder;
 use toon_format::encode_default as toon_encode;
 
 pub mod api;
@@ -13,9 +13,10 @@ pub mod semantic_search;
 
 use api::{DataprimeApi, QueryGenericResponse};
 
+use crate::cases_query_rules::check_cases_query_rules;
 use crate::config::OutputFormat;
-use crate::execution::{fan_out, ExecutionTarget};
-use crate::spill::{maybe_spill, transform_for_agents, SpillOutcome};
+use crate::execution::{fan_out, report_errors_and_collect_successes, ExecutionTarget};
+use crate::spill::{maybe_spill, transform_for_toon, SpillOutcome};
 use crate::time::parse_timestamp;
 use crate::Tier;
 
@@ -47,17 +48,6 @@ pub enum DataprimeFilter {
     All,
     Commands,
     Functions,
-}
-
-/// Row structure for the list table output.
-#[derive(Tabled)]
-struct ListRow {
-    #[tabled(rename = "Name")]
-    name: String,
-    #[tabled(rename = "Type")]
-    kind: String,
-    #[tabled(rename = "Description")]
-    description: String,
 }
 
 /// Load the DataPrime documentation from the bundle embedded at build time (`assets/dataprime_docs.yaml`).
@@ -139,21 +129,7 @@ pub fn run_list(
             println!("{}", serde_json::to_string_pretty(&json_items)?);
         }
         OutputFormat::Yaml => {
-            let yaml_items: Vec<_> = items
-                .iter()
-                .map(|(name, kind, entry)| {
-                    serde_json::json!({
-                        "name": name,
-                        "type": kind,
-                        "syntax": entry.syntax,
-                        "description": first_sentence(&entry.description),
-                        "category": entry.category,
-                    })
-                })
-                .collect::<Vec<_>>();
-            println!("{}", serde_yaml::to_string(&yaml_items)?.trim_end());
-        }
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let agent_items: Vec<_> = items
                 .iter()
                 .map(|(name, kind, entry)| {
@@ -175,16 +151,16 @@ pub fn run_list(
                 return Ok(());
             }
 
-            let rows: Vec<ListRow> = items
-                .iter()
-                .map(|(name, kind, entry)| ListRow {
-                    name: name.clone(),
-                    kind: kind.clone(),
-                    description: truncate(&first_sentence(&entry.description), 60),
-                })
-                .collect();
-
-            let table = Table::new(rows).to_string();
+            let mut builder = Builder::default();
+            builder.push_record(["Name", "Type", "Description"]);
+            for (name, kind, entry) in &items {
+                builder.push_record([
+                    name.clone(),
+                    kind.clone(),
+                    truncate(&first_sentence(&entry.description), 60),
+                ]);
+            }
+            let table = builder.build().to_string();
             println!("{table}");
             println!(
                 "\n{} items ({} commands, {} functions)",
@@ -237,16 +213,7 @@ pub fn run_help(name: &str, output: OutputFormat) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&json)?);
         }
         OutputFormat::Yaml => {
-            let val = serde_json::json!({
-                "name": name,
-                "type": kind,
-                "syntax": entry.syntax,
-                "description": entry.description,
-                "category": entry.category,
-            });
-            println!("{}", serde_yaml::to_string(&val)?.trim_end());
-        }
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let json = serde_json::json!({
                 "name": name,
                 "type": kind,
@@ -282,17 +249,15 @@ pub fn run_help(name: &str, output: OutputFormat) -> Result<()> {
 async fn execute_query(
     target: Arc<ExecutionTarget>,
     query: &str,
-    start: &str,
-    end: &str,
+    start_ts: &str,
+    end_ts: &str,
     limit: u32,
     tier: Tier,
     source: &str,
 ) -> Result<QueryGenericResponse> {
     let api = DataprimeApi::new(&target.client);
-    let start_ts = parse_timestamp(start)?;
-    let end_ts = parse_timestamp(end)?;
     Ok(api
-        .query_generic(query, &start_ts, &end_ts, limit, tier, source)
+        .query_generic(query, start_ts, end_ts, limit, tier, source)
         .await?)
 }
 
@@ -308,46 +273,45 @@ pub struct MergedResults {
 pub fn merge_results(
     per_profile: Vec<(String, Result<QueryGenericResponse>)>,
     include_profile: bool,
-) -> MergedResults {
+    cases_warning: Option<&str>,
+) -> Result<MergedResults> {
     let mut rows: Vec<Value> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    if let Some(w) = cases_warning {
+        warnings.push(w.to_string());
+    }
     let mut is_aggregate: Option<bool> = None;
 
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                for w in resp.warnings {
-                    warnings.push(format!("[{profile}] {w}"));
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        for w in resp.warnings {
+            warnings.push(format!("[{profile}] {w}"));
+        }
+        if is_aggregate.is_none() {
+            is_aggregate = Some(resp.is_aggregate);
+        }
+        if include_profile {
+            rows.extend(resp.raw_results.into_iter().map(|mut row| {
+                if let Value::Object(ref mut m) = row {
+                    m.insert("profile".to_string(), Value::String(profile.clone()));
                 }
-                if is_aggregate.is_none() {
-                    is_aggregate = Some(resp.is_aggregate);
-                }
-                if include_profile {
-                    rows.extend(resp.raw_results.into_iter().map(|mut row| {
-                        if let Value::Object(ref mut m) = row {
-                            m.insert("profile".to_string(), Value::String(profile.clone()));
-                        }
-                        row
-                    }));
-                } else {
-                    rows.extend(resp.raw_results);
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+                row
+            }));
+        } else {
+            rows.extend(resp.raw_results);
         }
     }
 
-    MergedResults {
+    Ok(MergedResults {
         rows,
         warnings,
         is_aggregate: is_aggregate.unwrap_or(false),
         include_profile,
-    }
+    })
 }
 
 /// Render merged results to stdout.
 ///
-/// JSON and Agents modes are handled generically. For Text mode, if a
+/// JSON and Toon modes are handled generically. For Text mode, if a
 /// `text_renderer` is provided it is used for source-specific formatting
 /// (e.g. logs show timestamp/severity, spans show traceID/duration).
 /// Otherwise rows are printed as pretty-printed JSON.
@@ -367,15 +331,13 @@ pub fn render_results(
             println!("{}", serde_json::to_string_pretty(&merged.rows)?);
         }
         OutputFormat::Yaml => {
-            println!("{}", serde_yaml::to_string(&merged.rows)?.trim_end());
-        }
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             if merged.is_aggregate {
                 let toon = toon_encode(&merged.rows)
                     .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
                 println!("{toon}");
             } else {
-                let agent_rows: Vec<_> = merged.rows.iter().map(transform_for_agents).collect();
+                let agent_rows: Vec<_> = merged.rows.iter().map(transform_for_toon).collect();
                 match maybe_spill(&agent_rows, max_direct, temp_dir)? {
                     SpillOutcome::Direct(json) => println!("{json}"),
                     SpillOutcome::Spilled { path, count } => {
@@ -422,16 +384,18 @@ pub async fn run_query(
 ) -> Result<()> {
     eprintln!("{}", "Querying...".dimmed());
 
+    let start_fmt = parse_timestamp(start)?;
+    let end_fmt = parse_timestamp(end)?;
+    let cases_warning = check_cases_query_rules(query, &start_fmt, &end_fmt);
+
     let include_profile = targets.len() > 1;
     let query = query.to_string();
     let source = source.to_string();
-    let start = start.to_string();
-    let end = end.to_string();
     let per_profile = fan_out(targets, |t| {
         let q = query.clone();
         let src = source.clone();
-        let s = start.clone();
-        let e = end.clone();
+        let s = start_fmt.clone();
+        let e = end_fmt.clone();
         async move {
             let effective_tier = tier.unwrap_or(t.cfg.default_tier);
             execute_query(t, &q, &s, &e, limit, effective_tier, &src).await
@@ -439,7 +403,7 @@ pub async fn run_query(
     })
     .await;
 
-    let merged = merge_results(per_profile, include_profile);
+    let merged = merge_results(per_profile, include_profile, cases_warning.as_deref())?;
     render_results(&merged, output, max_direct, temp_dir, text_renderer)
 }
 
@@ -529,7 +493,7 @@ category: ["Commands reference", "test"]
     fn merge_single_profile_omits_profile_field() {
         let rows = vec![json!({"userData": {"message": "hello"}})];
         let per_profile = vec![("prod".to_string(), Ok(make_generic_response(rows, false)))];
-        let merged = merge_results(per_profile, false);
+        let merged = merge_results(per_profile, false, None).unwrap();
 
         assert_eq!(merged.rows.len(), 1);
         assert!(!merged.include_profile);
@@ -554,7 +518,7 @@ category: ["Commands reference", "test"]
                 )),
             ),
         ];
-        let merged = merge_results(per_profile, true);
+        let merged = merge_results(per_profile, true, None).unwrap();
 
         assert_eq!(merged.rows.len(), 2);
         assert_eq!(merged.rows[0]["profile"], json!("prod"));
@@ -570,7 +534,7 @@ category: ["Commands reference", "test"]
             ),
             ("bad".to_string(), Err(anyhow::anyhow!("network error"))),
         ];
-        let merged = merge_results(per_profile, true);
+        let merged = merge_results(per_profile, true, None).unwrap();
 
         assert_eq!(merged.rows.len(), 1);
         assert_eq!(merged.rows[0]["profile"], json!("good"));
@@ -581,7 +545,7 @@ category: ["Commands reference", "test"]
         let mut resp = make_generic_response(vec![], false);
         resp.warnings = vec!["too many results".to_string()];
         let per_profile = vec![("prod".to_string(), Ok(resp))];
-        let merged = merge_results(per_profile, true);
+        let merged = merge_results(per_profile, true, None).unwrap();
 
         assert_eq!(merged.warnings.len(), 1);
         assert!(merged.warnings[0].contains("[prod]"));
@@ -593,7 +557,141 @@ category: ["Commands reference", "test"]
             ("p1".to_string(), Ok(make_generic_response(vec![], true))),
             ("p2".to_string(), Ok(make_generic_response(vec![], true))),
         ];
-        let merged = merge_results(per_profile, true);
+        let merged = merge_results(per_profile, true, None).unwrap();
         assert!(merged.is_aggregate);
+    }
+
+    #[test]
+    fn merge_single_profile_failure_returns_err() {
+        let per_profile: Vec<(String, anyhow::Result<QueryGenericResponse>)> =
+            vec![("prod".to_string(), Err(anyhow::anyhow!("boom")))];
+        let result = merge_results(per_profile, false, None);
+
+        assert!(result.is_err(), "single failing profile must bail");
+    }
+
+    #[test]
+    fn merge_all_profiles_failing_returns_err() {
+        let per_profile: Vec<(String, anyhow::Result<QueryGenericResponse>)> = vec![
+            ("prod".to_string(), Err(anyhow::anyhow!("timeout"))),
+            ("staging".to_string(), Err(anyhow::anyhow!("auth failed"))),
+        ];
+        let result = merge_results(per_profile, true, None);
+
+        assert!(
+            result.is_err(),
+            "must bail when every profile in the fan-out failed"
+        );
+    }
+
+    // ── check_cases_query_rules integration via merge_results ────────────────
+
+    use crate::cases_query_rules::check_cases_query_rules;
+
+    const CASES_START: &str = "2024-01-01T00:00:00.000Z";
+    const CASES_END: &str = "2024-01-01T02:00:00.000Z";
+    const CASES_QUERY: &str = "source system/labs.cases.state_updates | count";
+
+    #[test]
+    fn cases_warning_prepended_to_merged_warnings() {
+        let warning = check_cases_query_rules(CASES_QUERY, CASES_START, CASES_END);
+        assert!(
+            warning.is_some(),
+            "expected a warning from check_cases_query_rules"
+        );
+
+        let per_profile = vec![(
+            "prod".to_string(),
+            Ok(make_generic_response(vec![json!({"data": 1})], false)),
+        )];
+        let merged = merge_results(per_profile, false, warning.as_deref()).unwrap();
+
+        assert_eq!(merged.warnings.len(), 1);
+        assert!(
+            merged.warnings[0].contains("[Cases query warning]"),
+            "cases warning should be in merged warnings"
+        );
+    }
+
+    #[test]
+    fn cases_warning_plus_profile_warning_both_appear() {
+        let cases_warn = check_cases_query_rules(CASES_QUERY, CASES_START, CASES_END);
+        assert!(cases_warn.is_some());
+
+        let mut resp = make_generic_response(vec![], false);
+        resp.warnings = vec!["too many results".to_string()];
+        let per_profile = vec![("prod".to_string(), Ok(resp))];
+        let merged = merge_results(per_profile, true, cases_warn.as_deref()).unwrap();
+
+        assert_eq!(
+            merged.warnings.len(),
+            2,
+            "should have one cases warning and one profile warning"
+        );
+        assert!(merged.warnings[0].contains("[Cases query warning]"));
+        assert!(merged.warnings[1].contains("[prod]"));
+        assert!(merged.warnings[1].contains("too many results"));
+    }
+
+    #[test]
+    fn cases_warning_present_when_profile_errors() {
+        let cases_warn = check_cases_query_rules(CASES_QUERY, CASES_START, CASES_END);
+        assert!(cases_warn.is_some());
+        let warning_text = cases_warn.clone().unwrap();
+
+        // With a cases warning and a failed profile, the warning is still in
+        // merged.warnings (printed by render_results), not embedded in errors.
+        let per_profile: Vec<(String, anyhow::Result<QueryGenericResponse>)> = vec![
+            (
+                "good".to_string(),
+                Ok(make_generic_response(vec![json!({"ok": true})], false)),
+            ),
+            ("bad".to_string(), Err(anyhow::anyhow!("timeout"))),
+        ];
+        let merged = merge_results(per_profile, true, cases_warn.as_deref()).unwrap();
+
+        // The cases warning appears in merged.warnings regardless of profile errors.
+        assert!(
+            merged
+                .warnings
+                .iter()
+                .any(|w| w.contains("[Cases query warning]")),
+            "cases warning must be present even when a profile errors"
+        );
+        // The good profile's row is still included.
+        assert_eq!(merged.rows.len(), 1);
+        // The warning text is non-empty (contains Rule content).
+        assert!(warning_text.contains("Rule"));
+    }
+
+    #[test]
+    fn no_cases_warning_when_query_has_dedup() {
+        let warning = check_cases_query_rules(
+            "source system/labs.cases.state_updates | dedupeby caseId orderby $m.timestamp desc",
+            CASES_START,
+            CASES_END,
+        );
+        let per_profile = vec![("prod".to_string(), Ok(make_generic_response(vec![], false)))];
+        let merged = merge_results(per_profile, false, warning.as_deref()).unwrap();
+
+        assert!(
+            merged.warnings.is_empty(),
+            "no warnings expected for a compliant cases query"
+        );
+    }
+
+    #[test]
+    fn no_cases_warning_for_non_cases_source() {
+        let warning = check_cases_query_rules("source logs | limit 10", CASES_START, CASES_END);
+        assert!(warning.is_none());
+
+        let per_profile = vec![(
+            "prod".to_string(),
+            Ok(make_generic_response(vec![json!({"msg": "hi"})], false)),
+        )];
+        let merged = merge_results(per_profile, false, warning.as_deref()).unwrap();
+
+        assert!(merged.warnings.is_empty());
+        assert_eq!(merged.rows.len(), 1);
     }
 }

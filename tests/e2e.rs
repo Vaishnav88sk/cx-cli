@@ -16,6 +16,8 @@ mod harness;
 
 #[path = "e2e/actions.rs"]
 mod actions;
+#[path = "e2e/ai_center/mod.rs"]
+mod ai_center;
 #[path = "e2e/alerts/mod.rs"]
 mod alerts;
 #[path = "e2e/api_keys.rs"]
@@ -42,6 +44,8 @@ mod e2m;
 mod enrichments;
 #[path = "e2e/extensions.rs"]
 mod extensions;
+#[path = "e2e/infra.rs"]
+mod infra;
 #[path = "e2e/integrations.rs"]
 mod integrations;
 #[path = "e2e/ip_access.rs"]
@@ -72,6 +76,8 @@ mod routers;
 mod scopes;
 #[path = "e2e/search_fields/mod.rs"]
 mod search_fields;
+#[path = "e2e/service_catalog.rs"]
+mod service_catalog;
 #[path = "e2e/slos.rs"]
 mod slos;
 #[path = "e2e/spans/mod.rs"]

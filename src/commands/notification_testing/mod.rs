@@ -8,7 +8,7 @@ use serde_json::Value;
 use toon_format::encode_default as toon_encode;
 
 use crate::config::OutputFormat;
-use crate::execution::{fan_out, ExecutionTarget};
+use crate::execution::{fan_out, report_errors_and_collect_successes, ExecutionTarget};
 use crate::render;
 use api::NotificationTestingApi;
 
@@ -33,7 +33,7 @@ fn render_results(all_results: &[Value], output: OutputFormat) -> Result<()> {
     match output {
         OutputFormat::Json => render::render_json_auto(all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -63,11 +63,8 @@ pub async fn run_test_connector(
     })
     .await;
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(val) => all_results.push(val),
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (_profile, val) in report_errors_and_collect_successes(per_profile)? {
+        all_results.push(val);
     }
     render_results(&all_results, output)
 }
@@ -88,11 +85,8 @@ pub async fn run_test_destination(
     })
     .await;
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(val) => all_results.push(val),
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (_profile, val) in report_errors_and_collect_successes(per_profile)? {
+        all_results.push(val);
     }
     render_results(&all_results, output)
 }
@@ -113,11 +107,8 @@ pub async fn run_test_preset(
     })
     .await;
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(val) => all_results.push(val),
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (_profile, val) in report_errors_and_collect_successes(per_profile)? {
+        all_results.push(val);
     }
     render_results(&all_results, output)
 }
@@ -138,11 +129,8 @@ pub async fn run_test_routing_condition(
     })
     .await;
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(val) => all_results.push(val),
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (_profile, val) in report_errors_and_collect_successes(per_profile)? {
+        all_results.push(val);
     }
     render_results(&all_results, output)
 }
@@ -163,11 +151,8 @@ pub async fn run_test_template_render(
     })
     .await;
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(val) => all_results.push(val),
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (_profile, val) in report_errors_and_collect_successes(per_profile)? {
+        all_results.push(val);
     }
     render_results(&all_results, output)
 }

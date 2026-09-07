@@ -11,10 +11,10 @@ use toon_format::encode_default as toon_encode;
 pub mod api;
 
 use crate::config::OutputFormat;
-use crate::execution::{fan_out, ExecutionTarget};
+use crate::execution::{fan_out, report_errors_and_collect_successes, ExecutionTarget};
 use crate::render;
 use api::{
-    DashboardFolderItem, DashboardSearchResult, DashboardsApi, QueryByFieldResult,
+    DashboardFolderItem, DashboardSearchResult, DashboardsApi, IssueSeverity, QueryByFieldResult,
     QuerySearchResult,
 };
 
@@ -25,7 +25,30 @@ use crate::safety::confirm_destructive;
 /// JSON key for the source profile when merging multi-profile dashboard REST rows.
 const JSON_KEY_PROFILE: &str = "profile";
 
-/// Builds one catalog row as JSON for `json` / `agents` output after fan-out.
+/// Look up a string value at a JSON pointer path (e.g. `/dashboard/id`).
+fn json_str_at(v: &Value, pointer: &str) -> Option<String> {
+    v.pointer(pointer)
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+/// Extract a dashboard ID from a create/replace response, trying the shapes
+/// the API has been observed to return: a top-level `dashboardId`, a
+/// top-level `id`, or a nested `dashboard.id`. Returns `None` when the
+/// response carried no ID so callers can flag that rather than fabricate one.
+fn dashboard_id_from_response(resp: &Value) -> Option<String> {
+    json_str_at(resp, "/dashboardId")
+        .or_else(|| json_str_at(resp, "/id"))
+        .or_else(|| json_str_at(resp, "/dashboard/id"))
+}
+
+/// Extract a folder ID from a folder-create response, trying `folderId` then
+/// `id`. Returns `None` when the response carried no ID.
+fn folder_id_from_response(resp: &Value) -> Option<String> {
+    json_str_at(resp, "/folderId").or_else(|| json_str_at(resp, "/id"))
+}
+
+/// Builds one catalog row as JSON for `json` / `toon` output after fan-out.
 ///
 /// When `include_profile` is true (multiple `--profile`), injects the profile key so merged
 /// arrays stay attributable per account; text mode uses a separate table path.
@@ -61,7 +84,7 @@ fn catalog_item_to_json(
     v
 }
 
-/// Builds one dashboard-folder row as JSON for `json` / `agents` output after fan-out.
+/// Builds one dashboard-folder row as JSON for `json` / `toon` output after fan-out.
 ///
 /// Same contract as `catalog_item_to_json`: folder list responses are merged across
 /// profiles, so we normalize each item to a plain object (string ids via `id_str` /
@@ -83,7 +106,7 @@ fn folder_item_to_json(item: &DashboardFolderItem, include_profile: bool, profil
     v
 }
 
-/// One merged row for `json` / `agents`: `serde_json::to_value` (field names = JSON keys), then optional `profile`.
+/// One merged row for `json` / `toon`: `serde_json::to_value` (field names = JSON keys), then optional `profile`.
 pub fn profiled_api_row_to_json<T: Serialize>(
     profile: &str,
     row: &T,
@@ -125,24 +148,11 @@ async fn collect_semantic_search_results(
     })
     .await;
 
-    let target_count = per_profile.len();
-    let mut error_count = 0usize;
     let mut all_results: Vec<(String, DashboardSearchResult)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                for r in resp.results {
-                    all_results.push((profile.clone(), r));
-                }
-            }
-            Err(e) => {
-                error_count += 1;
-                eprintln!("{}", format!("error from profile '{profile}': {e:#}").red());
-            }
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        for r in resp.results {
+            all_results.push((profile.clone(), r));
         }
-    }
-    if target_count > 0 && error_count == target_count {
-        bail!("all profiles returned errors; see above for details");
     }
     Ok(all_results)
 }
@@ -207,24 +217,11 @@ async fn collect_query_search_results(
     })
     .await;
 
-    let target_count = per_profile.len();
-    let mut error_count = 0usize;
     let mut all_results: Vec<(String, QuerySearchResult)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                for r in resp.results {
-                    all_results.push((profile.clone(), r));
-                }
-            }
-            Err(e) => {
-                error_count += 1;
-                eprintln!("{}", format!("error from profile '{profile}': {e:#}").red());
-            }
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        for r in resp.results {
+            all_results.push((profile.clone(), r));
         }
-    }
-    if target_count > 0 && error_count == target_count {
-        bail!("all profiles returned errors; see above for details");
     }
     Ok(all_results)
 }
@@ -279,24 +276,11 @@ async fn collect_queries_by_field_results(
     })
     .await;
 
-    let target_count = per_profile.len();
-    let mut error_count = 0usize;
     let mut all_results: Vec<(String, QueryByFieldResult)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                for r in resp.queries {
-                    all_results.push((profile.clone(), r));
-                }
-            }
-            Err(e) => {
-                error_count += 1;
-                eprintln!("{}", format!("error from profile '{profile}': {e:#}").red());
-            }
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        for r in resp.queries {
+            all_results.push((profile.clone(), r));
         }
-    }
-    if target_count > 0 && error_count == target_count {
-        bail!("all profiles returned errors; see above for details");
     }
     Ok(all_results)
 }
@@ -367,9 +351,9 @@ pub async fn run_semantic_search(
             let json_rows = semantic_search_merged_json_rows(&all_results, include_profile)?;
             render::render_json(&json_rows)?;
         }
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let json_rows = semantic_search_merged_json_rows(&all_results, include_profile)?;
-            render::render_agents(&json_rows)?;
+            render::render_toon(&json_rows)?;
         }
         OutputFormat::Text => render_semantic_search_text_table(&all_results, include_profile),
     }
@@ -388,32 +372,28 @@ pub async fn run_catalog(targets: &[Arc<ExecutionTarget>], output: OutputFormat)
     })
     .await;
 
-    let target_count = per_profile.len();
-    let mut error_count = 0usize;
     let mut all_rows: Vec<Value> = Vec::new();
     let mut all_items: Vec<(String, api::DashboardCatalogItem)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                for item in resp.items {
-                    all_rows.push(catalog_item_to_json(&item, include_profile, &profile));
-                    all_items.push((profile.clone(), item));
-                }
-            }
-            Err(e) => {
-                error_count += 1;
-                eprintln!("{}", format!("error from profile '{profile}': {e:#}").red());
-            }
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        // Print the dashboards catalog page link to stderr once per
+        // profile. Skip when there are no dashboards, since there's
+        // nothing to view.
+        if !resp.items.is_empty() {
+            crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                crate::console_url::dashboards_url(b)
+            })
+            .await;
         }
-    }
-    if target_count > 0 && error_count == target_count {
-        bail!("all profiles returned errors; see above for details");
+        for item in resp.items {
+            all_rows.push(catalog_item_to_json(&item, include_profile, &profile));
+            all_items.push((profile.clone(), item));
+        }
     }
 
     match output {
         OutputFormat::Json => render::render_json(&all_rows)?,
         OutputFormat::Yaml => render::render_yaml(&all_rows)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon =
                 toon_encode(&all_rows).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -473,9 +453,9 @@ pub async fn run_search(
             let json_rows = query_search_merged_json_rows(&all_results, include_profile)?;
             render::render_json(&json_rows)?;
         }
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let json_rows = query_search_merged_json_rows(&all_results, include_profile)?;
-            render::render_agents(&json_rows)?;
+            render::render_toon(&json_rows)?;
         }
         OutputFormat::Text => render_query_search_text_table(&all_results, include_profile),
     }
@@ -505,9 +485,9 @@ pub async fn run_queries_by_field(
             let json_rows = queries_by_field_merged_json_rows(&all_results, include_profile)?;
             render::render_json(&json_rows)?;
         }
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let json_rows = queries_by_field_merged_json_rows(&all_results, include_profile)?;
-            render::render_agents(&json_rows)?;
+            render::render_toon(&json_rows)?;
         }
         OutputFormat::Text => {
             render_queries_by_field_text_table(&all_results, field_path, include_profile);
@@ -542,31 +522,22 @@ pub async fn run_get(
     })
     .await;
 
-    let target_count = per_profile.len();
-    let mut error_count = 0usize;
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut val) => {
-                if include_profile {
-                    render::tag_get_result(&mut val, &profile);
-                }
-                all_results.push(val);
-            }
-            Err(e) => {
-                error_count += 1;
-                eprintln!("{}", format!("error from profile '{profile}': {e:#}").red());
-            }
+    for (profile, mut val) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut val, &profile);
         }
-    }
-    if target_count > 0 && error_count == target_count {
-        bail!("all profiles returned errors; see above for details");
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::dashboard_url(b, dashboard_id)
+        })
+        .await;
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -699,76 +670,38 @@ pub async fn run_create(
     })
     .await;
 
-    let target_count = per_profile.len();
-    let mut error_count = 0usize;
-    let mut all_results: Vec<(String, String, Value)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut resp) => {
-                let created_id = resp
-                    .get("dashboardId")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| {
-                        resp.get("id")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .or_else(|| {
-                        resp.get("dashboard")
-                            .and_then(|d| d.get("id"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                if include_profile {
-                    render::tag_get_result(&mut resp, &profile);
-                }
-                all_results.push((profile, created_id, resp));
-            }
-            Err(e) => {
-                error_count += 1;
-                eprintln!("{}", format!("error from profile '{profile}': {e:#}").red());
-            }
+    let mut all_results: Vec<Value> = Vec::new();
+    for (profile, mut resp) in report_errors_and_collect_successes(per_profile)? {
+        let created_id = dashboard_id_from_response(&resp);
+        render::print_created(
+            "Created",
+            "dashboard",
+            Some(&name),
+            created_id.as_deref(),
+            &profile,
+        );
+        if let Some(id) = &created_id {
+            crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                crate::console_url::dashboard_url(b, id)
+            })
+            .await;
         }
-    }
-    if target_count > 0 && error_count == target_count {
-        bail!("all profiles returned errors; see above for details");
+        if include_profile {
+            render::tag_get_result(&mut resp, &profile);
+        }
+        all_results.push(resp);
     }
 
     match output {
-        OutputFormat::Json => {
-            let vals: Vec<Value> = all_results.iter().map(|(_, _, v)| v.clone()).collect();
-            render::render_json_auto(&vals)?;
-        }
         OutputFormat::Yaml => {
-            let vals: Vec<Value> = all_results.iter().map(|(_, _, v)| v.clone()).collect();
-            render::render_yaml_auto(&vals)?;
-        }
-        OutputFormat::Agents => {
-            let vals: Vec<&Value> = all_results.iter().map(|(_, _, v)| v).collect();
-            let toon =
-                toon_encode(&vals).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
+        OutputFormat::Json => render::render_json_auto(&all_results)?,
+        OutputFormat::Toon => {
+            let toon = toon_encode(&all_results)
+                .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
         }
-        OutputFormat::Text => {
-            if include_profile {
-                let rows: Vec<Vec<String>> = all_results
-                    .iter()
-                    .map(|(profile, id, _)| vec![profile.clone(), id.clone(), name.clone()])
-                    .collect();
-                render::render_table(&["ID", "Name"], rows, true);
-            } else {
-                let (_, id, _) = &all_results[0];
-                println!(
-                    "{}",
-                    format!("Created dashboard '{name}' (ID: {id})")
-                        .green()
-                        .bold()
-                );
-            }
-        }
+        // Status lines already printed to stderr via `print_created`.
+        OutputFormat::Text => {}
     }
 
     Ok(())
@@ -825,67 +758,40 @@ pub async fn run_replace(
     })
     .await;
 
-    let mut all_results: Vec<(String, String, Value)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut resp) => {
-                let replaced_id = resp
-                    .get("dashboardId")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| {
-                        resp.get("id")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .or_else(|| {
-                        resp.get("dashboard")
-                            .and_then(|d| d.get("id"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                if include_profile {
-                    render::tag_get_result(&mut resp, &profile);
-                }
-                all_results.push((profile, replaced_id, resp));
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    let mut all_results: Vec<Value> = Vec::new();
+    for (profile, mut resp) in report_errors_and_collect_successes(per_profile)? {
+        // The request already carried the dashboard's id (`dash_id`, required above), so
+        // fall back to it when the replace response comes back without one — some
+        // deployments return an empty body on a successful replace.
+        let replaced_id = dashboard_id_from_response(&resp).or_else(|| Some(dash_id.to_string()));
+        render::print_created(
+            "Replaced",
+            "dashboard",
+            Some(&name),
+            replaced_id.as_deref(),
+            &profile,
+        );
+        if let Some(id) = &replaced_id {
+            crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                crate::console_url::dashboard_url(b, id)
+            })
+            .await;
         }
+        if include_profile {
+            render::tag_get_result(&mut resp, &profile);
+        }
+        all_results.push(resp);
     }
 
     match output {
-        OutputFormat::Json => {
-            let vals: Vec<Value> = all_results.iter().map(|(_, _, v)| v.clone()).collect();
-            render::render_json_auto(&vals)?;
-        }
-        OutputFormat::Agents => {
-            let vals: Vec<&Value> = all_results.iter().map(|(_, _, v)| v).collect();
-            let toon =
-                toon_encode(&vals).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
+        OutputFormat::Json => render::render_json_auto(&all_results)?,
+        OutputFormat::Toon => {
+            let toon = toon_encode(&all_results)
+                .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
         }
-        OutputFormat::Text => {
-            if all_results.is_empty() {
-                return Ok(());
-            }
-            if include_profile {
-                let rows: Vec<Vec<String>> = all_results
-                    .iter()
-                    .map(|(profile, id, _)| vec![profile.clone(), id.clone(), name.clone()])
-                    .collect();
-                render::render_table(&["ID", "Name"], rows, true);
-            } else {
-                let (_, id, _) = &all_results[0];
-                println!(
-                    "{}",
-                    format!("Replaced dashboard '{name}' (ID: {id})")
-                        .green()
-                        .bold()
-                );
-            }
-        }
+        // Status lines already printed to stderr via `print_created`.
+        OutputFormat::Text => {}
     }
 
     Ok(())
@@ -905,14 +811,11 @@ pub async fn run_delete(targets: &[Arc<ExecutionTarget>], id: &str) -> Result<()
         }
     })
     .await;
-    for (profile, result) in per_profile {
-        match result {
-            Ok(()) => eprintln!(
-                "{}",
-                format!("Dashboard {id} deleted in profile '{profile}'.").green()
-            ),
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, ()) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!("Dashboard {id} deleted in profile '{profile}'.").green()
+        );
     }
     Ok(())
 }
@@ -933,32 +836,27 @@ pub async fn run_folders_list(
     })
     .await;
 
-    let target_count = per_profile.len();
-    let mut error_count = 0usize;
     let mut all_rows: Vec<Value> = Vec::new();
     let mut all_items: Vec<(String, DashboardFolderItem)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                for item in resp.folders {
-                    all_rows.push(folder_item_to_json(&item, include_profile, &profile));
-                    all_items.push((profile.clone(), item));
-                }
-            }
-            Err(e) => {
-                error_count += 1;
-                eprintln!("{}", format!("error from profile '{profile}': {e:#}").red());
-            }
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        // Folders live in the same catalog UI as the dashboards themselves,
+        // so link to the same page. Skip when there are no folders.
+        if !resp.folders.is_empty() {
+            crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                crate::console_url::dashboards_url(b)
+            })
+            .await;
         }
-    }
-    if target_count > 0 && error_count == target_count {
-        bail!("all profiles returned errors; see above for details");
+        for item in resp.folders {
+            all_rows.push(folder_item_to_json(&item, include_profile, &profile));
+            all_items.push((profile.clone(), item));
+        }
     }
 
     match output {
         OutputFormat::Json => render::render_json(&all_rows)?,
         OutputFormat::Yaml => render::render_yaml(&all_rows)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon =
                 toon_encode(&all_rows).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -1022,67 +920,32 @@ pub async fn run_folders_create(
     })
     .await;
 
-    let target_count = per_profile.len();
-    let mut error_count = 0usize;
-    let mut all_results: Vec<(String, String, Value)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut resp) => {
-                let created_id = resp
-                    .get("folderId")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| {
-                        resp.get("id")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    })
-                    .unwrap_or_else(|| "unknown".to_string());
-                if include_profile {
-                    render::tag_get_result(&mut resp, &profile);
-                }
-                all_results.push((profile, created_id, resp));
-            }
-            Err(e) => {
-                error_count += 1;
-                eprintln!("{}", format!("error from profile '{profile}': {e:#}").red());
-            }
+    let mut all_results: Vec<Value> = Vec::new();
+    for (profile, mut resp) in report_errors_and_collect_successes(per_profile)? {
+        let created_id = folder_id_from_response(&resp);
+        render::print_created(
+            "Created",
+            "dashboard folder",
+            Some(name),
+            created_id.as_deref(),
+            &profile,
+        );
+        if include_profile {
+            render::tag_get_result(&mut resp, &profile);
         }
-    }
-    if target_count > 0 && error_count == target_count {
-        bail!("all profiles returned errors; see above for details");
+        all_results.push(resp);
     }
 
     match output {
-        OutputFormat::Json => {
-            let vals: Vec<Value> = all_results.iter().map(|(_, _, v)| v.clone()).collect();
-            render::render_json_auto(&vals)?;
-        }
         OutputFormat::Yaml => {
-            let vals: Vec<Value> = all_results.iter().map(|(_, _, v)| v.clone()).collect();
-            render::render_yaml_auto(&vals)?;
-        }
-        OutputFormat::Agents => {
-            let vals: Vec<&Value> = all_results.iter().map(|(_, _, v)| v).collect();
-            let toon =
-                toon_encode(&vals).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
+        OutputFormat::Json => render::render_json_auto(&all_results)?,
+        OutputFormat::Toon => {
+            let toon = toon_encode(&all_results)
+                .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
         }
-        OutputFormat::Text => {
-            if include_profile {
-                let rows: Vec<Vec<String>> = all_results
-                    .iter()
-                    .map(|(profile, id, _)| vec![profile.clone(), id.clone(), name.to_string()])
-                    .collect();
-                render::render_table(&["ID", "Name"], rows, true);
-            } else {
-                let (_, id, _) = &all_results[0];
-                println!(
-                    "{}",
-                    format!("Created folder '{name}' (ID: {id})").green().bold()
-                );
-            }
-        }
+        // Status lines already printed to stderr via `print_created`.
+        OutputFormat::Text => {}
     }
 
     Ok(())
@@ -1100,14 +963,226 @@ pub async fn run_folders_delete(targets: &[Arc<ExecutionTarget>], id: &str) -> R
         }
     })
     .await;
-    for (profile, result) in per_profile {
-        match result {
-            Ok(()) => eprintln!(
-                "{}",
-                format!("Folder {id} deleted in profile '{profile}'.").green()
-            ),
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, ()) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!("Folder {id} deleted in profile '{profile}'.").green()
+        );
     }
     Ok(())
+}
+
+// ── Check (CheckDashboard) ────────────────────────────────────────────────────
+
+/// Build the `CheckDashboardRequest` JSON body for the `dashboardId` oneof arm.
+fn check_body_from_id(dashboard_id: &str) -> Value {
+    json!({ "dashboardId": dashboard_id })
+}
+
+/// Build the `CheckDashboardRequest` JSON body for the `dashboard` oneof arm,
+/// reusing `read_dashboard_body` to normalize a bare doc or a
+/// `{ "dashboard": {...} }` wrapper into the inner dashboard object.
+fn check_body_from_file(from_file: &str) -> Result<Value> {
+    let dashboard = read_dashboard_body(from_file)?;
+    Ok(json!({ "dashboard": dashboard }))
+}
+
+/// Colorize a severity string for text output.
+fn severity_colored(severity: IssueSeverity) -> String {
+    let s = match severity {
+        IssueSeverity::SeverityError => "SEVERITY_ERROR",
+        IssueSeverity::SeverityWarning => "SEVERITY_WARNING",
+        IssueSeverity::SeverityUnspecified => "SEVERITY_UNSPECIFIED",
+    };
+    match severity {
+        IssueSeverity::SeverityError => s.red().to_string(),
+        IssueSeverity::SeverityWarning => s.yellow().to_string(),
+        IssueSeverity::SeverityUnspecified => s.dimmed().to_string(),
+    }
+}
+
+/// Build one issue row as JSON for `json` / `toon` output.
+fn issue_json_row(issue: &api::DashboardCheckIssue, profile: &str, include_profile: bool) -> Value {
+    let mut row = serde_json::to_value(issue).unwrap_or_else(|_| json!({}));
+    if include_profile {
+        if let Value::Object(ref mut m) = row {
+            m.insert(
+                JSON_KEY_PROFILE.to_string(),
+                Value::String(profile.to_string()),
+            );
+        }
+    }
+    row
+}
+
+/// Validate a dashboard definition without persisting it
+/// (`DashboardsService.CheckDashboard`).
+///
+/// Exactly one of `from_file` or `dashboard_id` must be supplied:
+/// - `from_file` — path to a JSON file (or `-` for stdin) holding either a
+///   bare dashboard doc or a `{ "dashboard": {...} }` wrapper.
+/// - `dashboard_id` — validate a stored dashboard by id.
+///
+/// Read-only. Exits non-zero if any error-severity issue is found (CI gate).
+/// In multi-profile fan-out, any profile returning error-severity issues
+/// causes a non-zero exit, even if other profiles are clean — this is a
+/// deliberate carve-out from the usual "exit 0 if any profile succeeds" rule,
+/// because `check` is a validation gate first.
+pub async fn run_check(
+    targets: &[Arc<ExecutionTarget>],
+    from_file: Option<&str>,
+    dashboard_id: Option<&str>,
+    output: OutputFormat,
+) -> Result<()> {
+    // Mutually exclusive sources. clap enforces "both" via `conflicts_with`;
+    // we guard "neither" here with a clear message.
+    let body = match (from_file, dashboard_id) {
+        (Some(path), None) => {
+            eprintln!("{}", "Checking dashboard from file...".dimmed());
+            check_body_from_file(path)?
+        }
+        (None, Some(id)) => {
+            if id.trim().is_empty() {
+                bail!("dashboard id cannot be empty");
+            }
+            eprintln!("{}", format!("Checking dashboard {id}...").dimmed());
+            check_body_from_id(id)
+        }
+        (Some(_), Some(_)) => {
+            bail!("`--from-file` and `<dashboard_id>` are mutually exclusive; specify one")
+        }
+        (None, None) => {
+            bail!("specify either `--from-file <path>` or a `<dashboard_id>` to check")
+        }
+    };
+
+    let include_profile = targets.len() > 1;
+
+    let per_profile = fan_out(targets, |t| {
+        let body = body.clone();
+        async move {
+            let api = DashboardsApi::new(&t.client);
+            Ok(api.check(&body).await?)
+        }
+    })
+    .await;
+
+    let mut all_issues: Vec<(String, Vec<api::DashboardCheckIssue>)> = Vec::new();
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        if let Some(id) = dashboard_id {
+            crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                crate::console_url::dashboard_url(b, id)
+            })
+            .await;
+        }
+        all_issues.push((profile, resp.issues));
+    }
+
+    // CI-gate semantics: any error-severity issue (in any profile) fails.
+    let total_errors = all_issues
+        .iter()
+        .flat_map(|(_, issues)| issues.iter())
+        .filter(|i| i.severity.is_failure())
+        .count();
+    let total_issues = all_issues.iter().map(|(_, i)| i.len()).sum::<usize>();
+
+    match output {
+        OutputFormat::Json => {
+            let mut rows: Vec<Value> = Vec::new();
+            for (profile, issues) in &all_issues {
+                for issue in issues {
+                    rows.push(issue_json_row(issue, profile, include_profile));
+                }
+            }
+            render::render_json(&rows)?;
+        }
+        OutputFormat::Toon => {
+            let mut rows: Vec<Value> = Vec::new();
+            for (profile, issues) in &all_issues {
+                for issue in issues {
+                    rows.push(issue_json_row(issue, profile, include_profile));
+                }
+            }
+            render::render_toon(&rows)?;
+        }
+        OutputFormat::Text => {
+            if total_issues == 0 {
+                println!("{}", "Dashboard is valid (no issues)".green());
+            } else {
+                let mut rows: Vec<Vec<String>> = Vec::new();
+                for (profile, issues) in &all_issues {
+                    for issue in issues {
+                        let row = vec![
+                            profile.clone(),
+                            severity_colored(issue.severity),
+                            issue.location.clone().unwrap_or_default(),
+                            issue.message.clone().unwrap_or_default(),
+                        ];
+                        rows.push(row);
+                    }
+                }
+                render::render_table(&["Severity", "Location", "Message"], rows, include_profile);
+            }
+        }
+    }
+
+    if total_errors > 0 {
+        bail!(
+            "dashboard check found {total_errors} error(s) across profile(s); {} warning(s) ignored",
+            total_issues - total_errors
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard for the `render_table` profile-column contract.
+    ///
+    /// `format_table` strips the first cell of every row when
+    /// `include_profile` is false (single-profile mode). Callers must
+    /// therefore push the profile as the first element unconditionally;
+    /// conditional placement causes the severity column to be dropped and
+    /// the remaining columns to shift left. This test constructs rows the
+    /// same way `run_check` does and asserts the severity text survives
+    /// rendering in single-profile mode.
+    #[test]
+    fn run_check_rows_preserve_severity_in_single_profile_output() {
+        let profile = "mock-profile";
+        let issue = api::DashboardCheckIssue {
+            severity: api::IssueSeverity::SeverityWarning,
+            message: Some("Query uses deprecated function 'timeShift'".to_string()),
+            location: Some("/sections/1/rows/0/widgets/0/queries/0".to_string()),
+        };
+
+        // Mirrors the row construction in `run_check`'s Text branch.
+        let row = vec![
+            profile.to_string(),
+            severity_colored(issue.severity),
+            issue.location.clone().unwrap_or_default(),
+            issue.message.clone().unwrap_or_default(),
+        ];
+
+        let rendered = render::format_table(
+            &["Severity", "Location", "Message"],
+            vec![row],
+            false, // single-profile mode
+        );
+
+        // Severity text must be present (the bug dropped it via skip(1)).
+        assert!(
+            rendered.contains("SEVERITY_WARNING"),
+            "severity column dropped in single-profile output: {rendered}"
+        );
+        assert!(
+            rendered.contains("/sections/1/rows/0/widgets/0/queries/0"),
+            "location column missing in single-profile output: {rendered}"
+        );
+        assert!(
+            rendered.contains("Query uses deprecated function 'timeShift'"),
+            "message column missing in single-profile output: {rendered}"
+        );
+    }
 }

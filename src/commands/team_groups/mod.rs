@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use toon_format::encode_default as toon_encode;
 
 use crate::config::OutputFormat;
-use crate::execution::{fan_out, ExecutionTarget};
+use crate::execution::{fan_out, report_errors_and_collect_successes, ExecutionTarget};
 use crate::render;
 use api::{TeamGroup, TeamGroupsApi};
 
@@ -58,22 +58,25 @@ pub async fn run_list(targets: &[Arc<ExecutionTarget>], output: OutputFormat) ->
 
     let mut all_json: Vec<Value> = Vec::new();
     let mut all_items: Vec<(String, TeamGroup)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                for group in resp.groups {
-                    all_json.push(group_to_json(&group, include_profile, &profile));
-                    all_items.push((profile.clone(), group));
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        // Print the team groups list page link to stderr once per profile.
+        // Skip when there are no groups, since there's nothing to view.
+        if !resp.groups.is_empty() {
+            crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                crate::console_url::iam_groups_url(b)
+            })
+            .await;
+        }
+        for group in resp.groups {
+            all_json.push(group_to_json(&group, include_profile, &profile));
+            all_items.push((profile.clone(), group));
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json(&all_json)?,
         OutputFormat::Yaml => render::render_yaml(&all_json)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon =
                 toon_encode(&all_json).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -88,7 +91,7 @@ pub async fn run_list(targets: &[Arc<ExecutionTarget>], output: OutputFormat) ->
                 .map(|(profile, group)| {
                     vec![
                         profile.clone(),
-                        group.group_id.map(|id| id.to_string()).unwrap_or_default(),
+                        group.group_id.clone().unwrap_or_default(),
                         group.display_name().to_string(),
                         String::new(), // Members count not available in list response
                         group.display_description().to_string(),
@@ -125,22 +128,17 @@ pub async fn run_get(
 
     let mut all_json: Vec<Value> = Vec::new();
     let mut all_items: Vec<(String, TeamGroup)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                if let Some(group) = resp.group {
-                    all_json.push(group_to_json(&group, include_profile, &profile));
-                    all_items.push((profile.clone(), group));
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        if let Some(group) = resp.group {
+            all_json.push(group_to_json(&group, include_profile, &profile));
+            all_items.push((profile.clone(), group));
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_json)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_json)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon =
                 toon_encode(&all_json).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -155,7 +153,7 @@ pub async fn run_get(
                 .map(|(profile, group)| {
                     vec![
                         profile.clone(),
-                        group.group_id.map(|id| id.to_string()).unwrap_or_default(),
+                        group.group_id.clone().unwrap_or_default(),
                         group.display_name().to_string(),
                         group.display_description().to_string(),
                         group.group_type.clone().unwrap_or_default(),
@@ -195,22 +193,17 @@ pub async fn run_get_by_name(
 
     let mut all_json: Vec<Value> = Vec::new();
     let mut all_items: Vec<(String, TeamGroup)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                if let Some(group) = resp.group {
-                    all_json.push(group_to_json(&group, include_profile, &profile));
-                    all_items.push((profile.clone(), group));
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        if let Some(group) = resp.group {
+            all_json.push(group_to_json(&group, include_profile, &profile));
+            all_items.push((profile.clone(), group));
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_json)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_json)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon =
                 toon_encode(&all_json).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -225,7 +218,7 @@ pub async fn run_get_by_name(
                 .map(|(profile, group)| {
                     vec![
                         profile.clone(),
-                        group.group_id.map(|id| id.to_string()).unwrap_or_default(),
+                        group.group_id.clone().unwrap_or_default(),
                         group.display_name().to_string(),
                         group.display_description().to_string(),
                         group.group_type.clone().unwrap_or_default(),
@@ -265,22 +258,17 @@ pub async fn run_users(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut val) => {
-                if include_profile {
-                    render::tag_get_result(&mut val, &profile);
-                }
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, mut val) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut val, &profile);
         }
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -316,31 +304,31 @@ pub async fn run_create(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                if let Some(group) = resp.group {
-                    let name = group.display_name().to_string();
-                    let id = group
-                        .group_id
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    eprintln!(
-                        "{}",
-                        format!("Created team group '{name}' (ID: {id}) in profile '{profile}'.")
-                            .green()
-                    );
-                    all_results.push(group_to_json(&group, include_profile, &profile));
-                }
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        if let Some(group) = resp.group {
+            let name = group.display_name().to_string();
+            render::print_created(
+                "Created",
+                "team group",
+                Some(&name),
+                group.group_id.as_deref(),
+                &profile,
+            );
+            if let Some(id) = group.group_id.as_deref() {
+                crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                    crate::console_url::iam_group_url(b, id)
+                })
+                .await;
             }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+            let group_json = group_to_json(&group, include_profile, &profile);
+            all_results.push(group_json);
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -371,25 +359,25 @@ pub async fn run_update(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                if let Some(group) = resp.group {
-                    eprintln!(
-                        "{}",
-                        format!("Updated team group in profile '{profile}'.").green()
-                    );
-                    all_results.push(group_to_json(&group, targets.len() > 1, &profile));
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        if let Some(group) = resp.group {
+            eprintln!(
+                "{}",
+                format!("Updated team group in profile '{profile}'.").green()
+            );
+            let group_json = group_to_json(&group, targets.len() > 1, &profile);
+            crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                crate::console_url::iam_group_url(b, &group_id)
+            })
+            .await;
+            all_results.push(group_json);
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -411,14 +399,11 @@ pub async fn run_delete(targets: &[Arc<ExecutionTarget>], group_id: &str) -> Res
         }
     })
     .await;
-    for (profile, result) in per_profile {
-        match result {
-            Ok(()) => eprintln!(
-                "{}",
-                format!("Team group {group_id} deleted in profile '{profile}'.").green()
-            ),
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, ()) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!("Team group {group_id} deleted in profile '{profile}'.").green()
+        );
     }
     Ok(())
 }

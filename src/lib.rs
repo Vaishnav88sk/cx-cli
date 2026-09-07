@@ -1,12 +1,16 @@
 pub mod api_client;
 pub mod banner;
+pub mod cases_query_rules;
 pub mod commands;
 pub mod config;
+pub mod console_url;
 pub mod error;
 pub mod execution;
+pub mod identity;
 pub mod install_method;
 pub mod keyring_store;
 pub mod oauth;
+pub mod region;
 pub mod render;
 pub mod safety;
 pub mod serde_helpers;

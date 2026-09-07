@@ -1,6 +1,6 @@
 [package]
 name = "coralogix-cli"
-version = "0.1.10"
+version = "0.1.24"
 edition = "2021"
 description = "Coralogix CLI - the observability backbone for AI agents and engineering teams."
 repository = "https://github.com/coralogix/cx-cli"
@@ -29,6 +29,9 @@ serde_json = "1"
 serde_yaml = "0.9"
 toml = "1.1"
 
+# URL path-segment encoding (infra resource ids contain reserved characters)
+percent-encoding = "2"
+
 # Error handling
 anyhow = "1"
 thiserror = "2"
@@ -48,13 +51,16 @@ open = "5"
 
 # Terminal output
 colored = "3"
-tabled = { version = "0.20", features = ["ansi"] }
+tabled = { version = "0.21", default-features = false, features = ["ansi"] }
 indicatif = "0.18"
 terminal_size = "0.4"
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
 humantime = "2"
+
+# Regex (cases query rule validation)
+regex = "1"
 
 # URL building
 url = "2"
@@ -69,6 +75,7 @@ futures = "0.3.32"
 
 # Gzip decompression for artifact downloads
 flate2 = "1"
+uuid = { version = "1.24.0", features = ["v4"] }
 
 # ── Platform-specific keyring backends ─────────────────────────────────────────
 # macOS: Keychain

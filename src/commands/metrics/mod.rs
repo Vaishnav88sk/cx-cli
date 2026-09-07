@@ -13,7 +13,7 @@ use api::{MetricsApi, PromQueryInstantResponse, PromQueryRangeResponse};
 use crate::api_client::CxClient;
 use crate::commands::dataprime::semantic_search::{semantic_metric_lookup, SemanticMetricResult};
 use crate::config::OutputFormat;
-use crate::execution::{fan_out, ExecutionTarget};
+use crate::execution::{fan_out, report_errors_and_collect_successes, ExecutionTarget};
 use crate::render;
 use crate::time::parse_timestamp;
 
@@ -360,17 +360,14 @@ pub async fn run_query(
 
     // Merge: convert each profile's response to optionally tagged rows.
     let mut all_rows: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => all_rows.extend(instant_response_to_rows(&profile, resp, include_profile)),
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        all_rows.extend(instant_response_to_rows(&profile, resp, include_profile));
     }
 
     match output {
         OutputFormat::Json => render::render_json(&all_rows)?,
         OutputFormat::Yaml => render::render_yaml(&all_rows)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             if all_rows.is_empty() {
                 println!("[]");
                 return Ok(());
@@ -428,17 +425,14 @@ pub async fn run_query_range(
     .await;
 
     let mut all_rows: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => all_rows.extend(range_response_to_rows(&profile, resp, include_profile)),
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        all_rows.extend(range_response_to_rows(&profile, resp, include_profile));
     }
 
     match output {
         OutputFormat::Json => render::render_json(&all_rows)?,
         OutputFormat::Yaml => render::render_yaml(&all_rows)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             if all_rows.is_empty() {
                 println!("[]");
                 return Ok(());
@@ -500,19 +494,14 @@ pub async fn run_search(
         .await;
 
         let mut all_results: Vec<(String, SemanticMetricResult)> = Vec::new();
-        for (profile, result) in per_profile {
-            match result {
-                Ok(results) => {
-                    for r in results {
-                        all_results.push((profile.clone(), r));
-                    }
-                }
-                Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+        for (profile, results) in report_errors_and_collect_successes(per_profile)? {
+            for r in results {
+                all_results.push((profile.clone(), r));
             }
         }
 
         match output {
-            OutputFormat::Json | OutputFormat::Agents => {
+            OutputFormat::Json | OutputFormat::Toon => {
                 let json_rows: Vec<Value> = all_results
                     .iter()
                     .map(|(profile, r)| {
@@ -525,7 +514,11 @@ pub async fn run_search(
                         v
                     })
                     .collect();
-                render::render_json(&json_rows)?;
+                if output == OutputFormat::Toon {
+                    render::render_toon(&json_rows)?;
+                } else {
+                    render::render_json(&json_rows)?;
+                }
             }
             OutputFormat::Yaml => {
                 let yaml_rows: Vec<Value> = all_results
@@ -583,14 +576,9 @@ pub async fn run_search(
     .await;
 
     let mut all_matches: Vec<(String, String)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(names) => {
-                for n in names {
-                    all_matches.push((profile.clone(), n));
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, names) in report_errors_and_collect_successes(per_profile)? {
+        for n in names {
+            all_matches.push((profile.clone(), n));
         }
     }
 
@@ -605,15 +593,7 @@ pub async fn run_search(
             )?;
         }
         OutputFormat::Yaml => {
-            let names: Vec<&str> = all_matches.iter().map(|(_, n)| n.as_str()).collect();
-            render::render_yaml(
-                &names
-                    .iter()
-                    .map(|n| Value::String(n.to_string()))
-                    .collect::<Vec<_>>(),
-            )?;
-        }
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             if all_matches.is_empty() {
                 println!("[]");
                 return Ok(());
@@ -665,19 +645,14 @@ pub async fn run_get_labels(
     .await;
 
     let mut all_labels: Vec<(String, String)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(labels) => {
-                for l in labels {
-                    all_labels.push((profile.clone(), l));
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, labels) in report_errors_and_collect_successes(per_profile)? {
+        for l in labels {
+            all_labels.push((profile.clone(), l));
         }
     }
 
     match output {
-        OutputFormat::Json | OutputFormat::Agents => {
+        OutputFormat::Json | OutputFormat::Toon => {
             let json_rows: Vec<Value> = if include_profile {
                 all_labels
                     .iter()
@@ -689,7 +664,11 @@ pub async fn run_get_labels(
                     .map(|(_, label)| json!({"label": label}))
                     .collect()
             };
-            render::render_json(&json_rows)?;
+            if output == OutputFormat::Toon {
+                render::render_toon(&json_rows)?;
+            } else {
+                render::render_json(&json_rows)?;
+            }
         }
         OutputFormat::Yaml => {
             let yaml_rows: Vec<Value> = if include_profile {

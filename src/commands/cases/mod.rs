@@ -8,7 +8,7 @@ use serde_json::Value;
 use toon_format::encode_default as toon_encode;
 
 use crate::config::OutputFormat;
-use crate::execution::{fan_out, ExecutionTarget};
+use crate::execution::{fan_out, report_errors_and_collect_successes, ExecutionTarget};
 use crate::render;
 use api::{Case, CasesApi, TeammateDirectory};
 
@@ -299,19 +299,18 @@ pub async fn run_get(
     .await;
 
     let mut all_results: Vec<(Value, TeammateDirectory)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok((mut val, directory)) => {
-                if let Some(case) = val.get_mut("case") {
-                    substitute_assignee_email(case, &directory);
-                }
-                if include_profile {
-                    render::tag_get_result(&mut val, &profile);
-                }
-                all_results.push((val, directory));
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, (mut val, directory)) in report_errors_and_collect_successes(per_profile)? {
+        if let Some(case) = val.get_mut("case") {
+            substitute_assignee_email(case, &directory);
         }
+        if include_profile {
+            render::tag_get_result(&mut val, &profile);
+        }
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::case_url(b, case_id)
+        })
+        .await;
+        all_results.push((val, directory));
     }
 
     // Most renderers want only the JSON values; the directory we keep for the
@@ -320,7 +319,7 @@ pub async fn run_get(
     match output {
         OutputFormat::Json => render::render_json_auto(&values)?,
         OutputFormat::Yaml => render::render_yaml_auto(&values)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon =
                 toon_encode(&values).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -419,11 +418,14 @@ pub async fn run_update(
     .await;
 
     finish_lifecycle(
+        targets,
+        case_id,
         per_profile,
         targets.len() > 1,
         output,
         &format!("Updated case '{case_id}'"),
     )
+    .await
 }
 
 pub async fn run_comment(
@@ -450,11 +452,14 @@ pub async fn run_comment(
     .await;
 
     finish_lifecycle(
+        targets,
+        case_id,
         per_profile,
         targets.len() > 1,
         output,
         &format!("Added comment to case '{case_id}'"),
     )
+    .await
 }
 
 pub async fn run_assign(
@@ -511,11 +516,14 @@ pub async fn run_assign(
     .await;
 
     finish_lifecycle(
+        targets,
+        case_id,
         per_profile,
         targets.len() > 1,
         output,
         &format!("Assigned case '{case_id}' to '{user}'"),
     )
+    .await
 }
 
 pub async fn run_unassign(
@@ -534,11 +542,14 @@ pub async fn run_unassign(
     })
     .await;
     finish_lifecycle(
+        targets,
+        case_id,
         per_profile,
         targets.len() > 1,
         output,
         &format!("Unassigned case '{case_id}'"),
     )
+    .await
 }
 
 pub async fn run_acknowledge(
@@ -557,11 +568,14 @@ pub async fn run_acknowledge(
     })
     .await;
     finish_lifecycle(
+        targets,
+        case_id,
         per_profile,
         targets.len() > 1,
         output,
         &format!("Acknowledged case '{case_id}'"),
     )
+    .await
 }
 
 pub async fn run_unacknowledge(
@@ -580,11 +594,14 @@ pub async fn run_unacknowledge(
     })
     .await;
     finish_lifecycle(
+        targets,
+        case_id,
         per_profile,
         targets.len() > 1,
         output,
         &format!("Unacknowledged case '{case_id}'"),
     )
+    .await
 }
 
 pub async fn run_resolve(
@@ -606,11 +623,14 @@ pub async fn run_resolve(
     })
     .await;
     finish_lifecycle(
+        targets,
+        case_id,
         per_profile,
         targets.len() > 1,
         output,
         &format!("Resolved case '{case_id}'"),
     )
+    .await
 }
 
 pub async fn run_close(
@@ -629,11 +649,14 @@ pub async fn run_close(
     })
     .await;
     finish_lifecycle(
+        targets,
+        case_id,
         per_profile,
         targets.len() > 1,
         output,
         &format!("Closed case '{case_id}'"),
     )
+    .await
 }
 
 pub async fn run_set_priority(
@@ -660,11 +683,14 @@ pub async fn run_set_priority(
     })
     .await;
     finish_lifecycle(
+        targets,
+        case_id,
         per_profile,
         targets.len() > 1,
         output,
         &format!("Set priority of case '{case_id}' to {normalized}"),
     )
+    .await
 }
 
 pub async fn run_clear_priority(
@@ -686,11 +712,14 @@ pub async fn run_clear_priority(
     })
     .await;
     finish_lifecycle(
+        targets,
+        case_id,
         per_profile,
         targets.len() > 1,
         output,
         &format!("Cleared priority override of case '{case_id}'"),
     )
+    .await
 }
 
 pub async fn run_events_list(
@@ -722,27 +751,22 @@ pub async fn run_events_list(
     .await;
 
     let mut all_json: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok((resp, directory)) => {
-                for mut event in resp.events {
-                    substitute_user_emails(&mut event, &directory);
-                    if include_profile {
-                        if let Value::Object(ref mut m) = event {
-                            m.insert("profile".to_string(), Value::String(profile.clone()));
-                        }
-                    }
-                    all_json.push(event);
+    for (profile, (resp, directory)) in report_errors_and_collect_successes(per_profile)? {
+        for mut event in resp.events {
+            substitute_user_emails(&mut event, &directory);
+            if include_profile {
+                if let Value::Object(ref mut m) = event {
+                    m.insert("profile".to_string(), Value::String(profile.clone()));
                 }
             }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+            all_json.push(event);
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json(&all_json)?,
         OutputFormat::Yaml => render::render_yaml(&all_json)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon =
                 toon_encode(&all_json).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -818,22 +842,17 @@ pub async fn run_event_get(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut val) => {
-                if include_profile {
-                    render::tag_get_result(&mut val, &profile);
-                }
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, mut val) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut val, &profile);
         }
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -878,37 +897,32 @@ pub async fn run_notifications(
     // Response shape: { "deliveriesByCase": { "<case-id>": { "notificationDeliveries": [ ... ] } } }
     // For text/json rendering, flatten into rows tagged with caseId so the output is tabular-friendly.
     let mut all_json: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(val) => {
-                let map = val.get("deliveriesByCase").and_then(|v| v.as_object());
-                if let Some(map) = map {
-                    for (case_id, payload) in map {
-                        let deliveries = payload
-                            .get("notificationDeliveries")
-                            .and_then(|v| v.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-                        for mut delivery in deliveries {
-                            if let Value::Object(ref mut m) = delivery {
-                                m.insert("caseId".to_string(), Value::String(case_id.clone()));
-                                if include_profile {
-                                    m.insert("profile".to_string(), Value::String(profile.clone()));
-                                }
-                            }
-                            all_json.push(delivery);
+    for (profile, val) in report_errors_and_collect_successes(per_profile)? {
+        let map = val.get("deliveriesByCase").and_then(|v| v.as_object());
+        if let Some(map) = map {
+            for (case_id, payload) in map {
+                let deliveries = payload
+                    .get("notificationDeliveries")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                for mut delivery in deliveries {
+                    if let Value::Object(ref mut m) = delivery {
+                        m.insert("caseId".to_string(), Value::String(case_id.clone()));
+                        if include_profile {
+                            m.insert("profile".to_string(), Value::String(profile.clone()));
                         }
                     }
+                    all_json.push(delivery);
                 }
             }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json(&all_json)?,
         OutputFormat::Yaml => render::render_yaml(&all_json)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon =
                 toon_encode(&all_json).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -960,34 +974,36 @@ pub async fn run_notifications(
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Collect per-profile lifecycle results, emit a success/error line per profile,
-/// and render JSON/agents output for the returned payloads.
-fn finish_lifecycle(
+/// print a "View in Coralogix" console link when one can be resolved, and
+/// render JSON/toon output for the returned payloads.
+async fn finish_lifecycle(
+    targets: &[Arc<ExecutionTarget>],
+    case_id: &str,
     per_profile: Vec<(String, Result<Value>)>,
     include_profile: bool,
     output: OutputFormat,
     success_label: &str,
 ) -> Result<()> {
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut v) => {
-                if include_profile {
-                    render::tag_get_result(&mut v, &profile);
-                }
-                all_results.push(v);
-                eprintln!(
-                    "{}",
-                    format!("{success_label} in profile '{profile}'.").green()
-                );
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, mut v) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut v, &profile);
         }
+        eprintln!(
+            "{}",
+            format!("{success_label} in profile '{profile}'.").green()
+        );
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::case_url(b, case_id)
+        })
+        .await;
+        all_results.push(v);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
         OutputFormat::Yaml => render::render_yaml_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
