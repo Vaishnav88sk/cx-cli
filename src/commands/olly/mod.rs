@@ -23,12 +23,14 @@ use crate::spill::{self, maybe_spill, SpillOutcome};
 ///
 /// Creates a new chat if `chat_id` is None, otherwise continues an existing chat.
 /// Uses blocking mode to wait for the response.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ask(
     targets: &[Arc<ExecutionTarget>],
     message: &str,
     chat_id: Option<&str>,
     model: &str,
     timeout: u32,
+    agent_to_agent_mode: bool,
     output: OutputFormat,
 ) -> Result<()> {
     // Olly is single-profile only - chats belong to a specific user/team
@@ -37,7 +39,7 @@ pub async fn run_ask(
     }
 
     let target = &targets[0];
-    let api = OllyApi::new(&target.cfg.endpoint, &target.cfg.api_key, target.cfg.verbose)?;
+    let api = OllyApi::from_client(target.client.clone());
 
     // Create a new chat if no chat_id provided
     let chat_id = match chat_id {
@@ -50,7 +52,15 @@ pub async fn run_ask(
     };
 
     eprintln!("{}", "Sending message...".dimmed());
-    let interaction = api.send_message(&chat_id, message, model, timeout).await?;
+    let interaction = api
+        .send_message(&chat_id, message, model, timeout, agent_to_agent_mode)
+        .await?;
+
+    // Olly is single-profile only, so unlike other command groups this uses
+    // the resolved target directly rather than looking one up by profile name.
+    target
+        .emit_console_link(|base| crate::console_url::olly_chat_url(base, &chat_id))
+        .await;
 
     // Render based on output format
     match output {
@@ -58,7 +68,7 @@ pub async fn run_ask(
             let response = interaction_to_json(&interaction, &chat_id);
             render::render_json(&[response])?;
         }
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let response = interaction_to_json(&interaction, &chat_id);
             let toon = toon_encode(&[response])
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
@@ -96,7 +106,7 @@ pub async fn run_artifacts_get(
     }
 
     let target = &targets[0];
-    let api = OllyApi::new(&target.cfg.endpoint, &target.cfg.api_key, target.cfg.verbose)?;
+    let api = OllyApi::from_client(target.client.clone());
 
     eprintln!("{}", "Fetching artifact...".dimmed());
     let artifact = api.get_artifact(artifact_id).await?;
@@ -139,7 +149,7 @@ pub async fn run_artifacts_get(
         OutputFormat::Json => {
             render_artifact_json(&artifact, &processed)?;
         }
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             render_artifact_agents(&artifact, &processed, max_direct, temp_dir)?;
         }
         OutputFormat::Text => {
@@ -310,7 +320,7 @@ pub async fn run_artifacts_list(
     }
 
     let target = &targets[0];
-    let api = OllyApi::new(&target.cfg.endpoint, &target.cfg.api_key, target.cfg.verbose)?;
+    let api = OllyApi::from_client(target.client.clone());
 
     eprintln!("{}", "Fetching artifacts...".dimmed());
     let artifacts = api.list_artifacts().await?;
@@ -320,7 +330,7 @@ pub async fn run_artifacts_list(
             let response: Vec<Value> = artifacts.iter().map(artifact_to_json).collect();
             render::render_json(&response)?;
         }
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let response: Vec<Value> = artifacts.iter().map(artifact_to_json).collect();
             let toon =
                 toon_encode(&response).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
@@ -408,42 +418,35 @@ fn artifact_to_json(artifact: &api::Artifact) -> Value {
 }
 
 fn render_artifacts_list_text(artifacts: &[api::Artifact]) -> Result<()> {
-    use tabled::{settings::Style, Table, Tabled};
-
-    #[derive(Tabled)]
-    struct Row {
-        #[tabled(rename = "ID")]
-        id: String,
-        #[tabled(rename = "FILENAME")]
-        filename: String,
-        #[tabled(rename = "TYPE")]
-        artifact_type: String,
-        #[tabled(rename = "SIZE")]
-        size: String,
-        #[tabled(rename = "CREATED")]
-        created_at: String,
-    }
+    use tabled::{builder::Builder, settings::Style};
 
     if artifacts.is_empty() {
         println!("{}", "No artifacts found.".yellow());
         return Ok(());
     }
 
-    let rows: Vec<Row> = artifacts
-        .iter()
-        .map(|a| Row {
-            id: a.id.clone().unwrap_or_else(|| "-".to_string()),
-            filename: a.filename.clone().unwrap_or_else(|| "-".to_string()),
-            artifact_type: a.artifact_type.clone().unwrap_or_else(|| "-".to_string()),
-            size: a
+    let mut builder = Builder::default();
+    builder.push_record(["ID", "FILENAME", "TYPE", "SIZE", "CREATED"]);
+    for artifact in artifacts {
+        builder.push_record([
+            artifact.id.clone().unwrap_or_else(|| "-".to_string()),
+            artifact.filename.clone().unwrap_or_else(|| "-".to_string()),
+            artifact
+                .artifact_type
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+            artifact
                 .size
                 .map(|s| format!("{} B", s))
                 .unwrap_or_else(|| "-".to_string()),
-            created_at: a.created_at.clone().unwrap_or_else(|| "-".to_string()),
-        })
-        .collect();
+            artifact
+                .created_at
+                .clone()
+                .unwrap_or_else(|| "-".to_string()),
+        ]);
+    }
 
-    let table = Table::new(rows).with(Style::blank()).to_string();
+    let table = builder.build().with(Style::blank()).to_string();
     println!("{table}");
 
     Ok(())

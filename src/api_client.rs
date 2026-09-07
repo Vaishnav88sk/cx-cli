@@ -1,8 +1,18 @@
+use std::time::Duration;
+
 use reqwest::{header, Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::error::{CxError, Result};
+use crate::safety::AGENT_ENV_VARS;
+
+fn cli_user_agent(agent_env_var: Option<&str>) -> String {
+    match agent_env_var {
+        Some(agent_env_var) => format!("cx-cli/{}", agent_env_var.to_ascii_lowercase()),
+        None => "cx-cli/direct".to_string(),
+    }
+}
 
 /// Thin wrapper around reqwest::Client pre-configured with Coralogix auth.
 #[derive(Clone)]
@@ -14,6 +24,16 @@ pub struct CxClient {
 
 impl CxClient {
     pub fn new(endpoint: impl Into<String>, api_key: &str, verbose: bool) -> Result<Self> {
+        Self::with_timeout(endpoint, api_key, None, verbose)
+    }
+
+    /// Builds a client with an optional deadline for each HTTP request.
+    pub fn with_timeout(
+        endpoint: impl Into<String>,
+        api_key: &str,
+        timeout: Option<Duration>,
+        verbose: bool,
+    ) -> Result<Self> {
         let mut headers = header::HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
@@ -24,17 +44,35 @@ impl CxClient {
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("application/json"),
         );
+        headers.insert(
+            header::HeaderName::from_static("x-cx-sdk-version"),
+            header::HeaderValue::from_static(concat!("cx-cli-", env!("CARGO_PKG_VERSION"))),
+        );
 
-        let inner = Client::builder()
+        let agent_env_var = AGENT_ENV_VARS
+            .iter()
+            .find(|var| std::env::var(var).is_ok())
+            .copied();
+        let mut builder = Client::builder()
             .default_headers(headers)
-            .user_agent(concat!("cx-cli/", env!("CARGO_PKG_VERSION")))
-            .build()?;
+            .user_agent(cli_user_agent(agent_env_var));
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
+        let inner = builder.build()?;
 
         Ok(Self {
             inner,
             endpoint: normalize_endpoint(&endpoint.into()),
             verbose,
         })
+    }
+
+    /// The normalized base endpoint this client sends requests to (no trailing
+    /// slash). Used for diagnostics — e.g. naming the endpoint in the
+    /// health-check error when a region/URL looks wrong.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     /// POST JSON body, return the raw response text.
@@ -246,7 +284,7 @@ fn normalize_endpoint(endpoint: &str) -> String {
 ///
 /// Returns `None` when the body is not JSON, none of the fields are present,
 /// or every candidate is an empty string.
-fn extract_error_detail(body: &str) -> Option<String> {
+pub(crate) fn extract_error_detail(body: &str) -> Option<String> {
     let v: Value = serde_json::from_str(body).ok()?;
     let non_empty = |val: &Value| val.as_str().filter(|s| !s.is_empty()).map(String::from);
     non_empty(&v["message"])
@@ -257,7 +295,14 @@ fn extract_error_detail(body: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_error_detail, normalize_endpoint};
+    use super::{cli_user_agent, extract_error_detail, normalize_endpoint};
+
+    #[test]
+    fn user_agent_uses_detected_agent_environment_variable() {
+        assert_eq!(cli_user_agent(Some("CURSOR_AGENT")), "cx-cli/cursor_agent");
+        assert_eq!(cli_user_agent(Some("CLAUDE_CODE")), "cx-cli/claude_code");
+        assert_eq!(cli_user_agent(None), "cx-cli/direct");
+    }
 
     #[test]
     fn trims_single_trailing_slash() {

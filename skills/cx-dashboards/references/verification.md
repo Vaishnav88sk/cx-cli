@@ -1,6 +1,6 @@
 # Phase 5: Live-verify every query through the cx CLI
 
-Every PromQL and DataPrime query in the draft dashboard must successfully run through `cx` before Phase 7 ships it. This is where invented metric names, typoed field paths, and malformed DataPrime pipelines get caught.
+Every PromQL and DataPrime query in the draft dashboard must successfully run through `cx` before Phase 8 ships it. This is where invented metric names, typoed field paths, and malformed DataPrime pipelines get caught.
 
 ---
 
@@ -27,13 +27,13 @@ For every widget whose definition contains a `promqlQuery`, substitute `${__rang
 **Instant-style widgets** (`gauge` / `pieChart` / `dataTable` with `promqlQueryType: PROM_QL_QUERY_TYPE_INSTANT`):
 
 ```bash
-cx metrics query '<expression-with-[$RANGE]-substituted>' -o agents
+cx metrics query '<expression-with-[$RANGE]-substituted>' -o toon
 ```
 
 **Time-series widgets** (`lineChart`):
 
 ```bash
-cx metrics query-range '<expression>' --start now-$RANGE --end now --step <auto> -o agents
+cx metrics query-range '<expression>' --start now-$RANGE --end now --step <auto> -o toon
 ```
 
 Pick `<step>` proportional to `$RANGE`: `1m` for 1–6h, `5m` for 24h, `1h` for 7d+. Match any window used by a `*_over_time` / `rate` / `increase` inside the expression if it's narrower than `$RANGE`.

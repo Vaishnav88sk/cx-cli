@@ -4,13 +4,21 @@ use std::path::PathBuf;
 use std::os::unix::fs::PermissionsExt;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::keyring_store;
 use crate::oauth;
 
+/// How long (in days) a cached team console base URL (see
+/// [`Profile::cached_console_url`]) stays fresh before it is re-resolved via
+/// `GET /identity/whoami`. The team URL is effectively immutable, so the TTL
+/// only exists to recover from a bad cache and to pick up the rare region
+/// migration.
+const CONSOLE_URL_CACHE_TTL_DAYS: i64 = 7;
+
 /// Authentication method used by a profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthKind {
     /// Static Coralogix API key.  Default for legacy profiles that pre-date OAuth.
@@ -18,6 +26,15 @@ pub enum AuthKind {
     ApiKey,
     /// OAuth 2.0 + OIDC browser login with automatic token refresh.
     OAuth,
+}
+
+impl AuthKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            AuthKind::ApiKey => "api_key",
+            AuthKind::OAuth => "oauth",
+        }
+    }
 }
 
 /// Where API keys are stored for a profile.
@@ -40,8 +57,13 @@ pub enum OutputFormat {
     Text,
     /// Raw JSON output.
     Json,
-    /// Token-aware, AI-agent-optimised JSON output.
-    Agents,
+    /// Token-aware, AI-agent-optimised TOON output.
+    ///
+    /// `agents` is accepted as a deprecated alias for backward compatibility
+    /// (both on the `-o/--output` flag and in config/profile files).
+    #[value(alias = "agents")]
+    #[serde(alias = "agents")]
+    Toon,
 }
 
 impl OutputFormat {
@@ -49,7 +71,7 @@ impl OutputFormat {
         match self {
             OutputFormat::Text => "text",
             OutputFormat::Json => "json",
-            OutputFormat::Agents => "agents",
+            OutputFormat::Toon => "toon",
         }
     }
 }
@@ -61,7 +83,7 @@ impl std::fmt::Display for OutputFormat {
 }
 
 /// Coralogix region, used to resolve the API endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Region {
     Us1,
@@ -90,6 +112,24 @@ impl Region {
             Region::Ap3 => "https://api.ap3.coralogix.com",
             Region::Stg1 => "https://api.stg1.coralogix.net",
             Region::Custom(url) => url.as_str(),
+        }
+    }
+
+    /// Browser-console host suffix for this region (no scheme or team label).
+    ///
+    /// `None` for custom endpoints, which have no standard app domain.
+    pub fn app_url_template(&self) -> Option<&str> {
+        match self {
+            Region::Us1 => Some("app.coralogix.us"),
+            Region::Us2 => Some("app.cx498.coralogix.com"),
+            Region::Us3 => Some("app.us3.coralogix.com"),
+            Region::Eu1 => Some("coralogix.com"),
+            Region::Eu2 => Some("app.eu2.coralogix.com"),
+            Region::Ap1 => Some("app.coralogix.in"),
+            Region::Ap2 => Some("app.coralogixsg.com"),
+            Region::Ap3 => Some("app.ap3.coralogix.com"),
+            Region::Stg1 => Some("app.stg1.coralogix.net"),
+            Region::Custom(_) => None,
         }
     }
 }
@@ -151,7 +191,7 @@ pub struct Config {
     pub default_output_format: OutputFormat,
 
     /// Maximum serialized byte size of a non-aggregated Dataprime response
-    /// that can be printed directly to stdout in `agents` mode. If the payload
+    /// that can be printed directly to stdout in `toon` mode. If the payload
     /// exceeds this limit the data is written to a temp file instead.
     /// Set to `-1` to disable the limit (always print directly).
     /// Default: 100 KiB (102400 bytes).
@@ -180,6 +220,12 @@ pub struct Config {
     /// Equivalent to always passing --read-only.
     #[serde(default)]
     pub read_only: bool,
+
+    /// When true, "View in Coralogix" console links (the stderr line) are
+    /// suppressed for ALL invocations. Equivalent to always passing
+    /// --no-console-link.
+    #[serde(default)]
+    pub no_console_link: bool,
 
     /// Shell completion scripts installed and tracked by `cx completions install`.
     /// Only files recorded here are touched by `cx completions refresh`.
@@ -213,6 +259,7 @@ impl Default for Config {
             allow_risky_commands: true,
             olly_enabled: true,
             read_only: false,
+            no_console_link: false,
             managed_completions: vec![],
         }
     }
@@ -309,6 +356,28 @@ pub struct Profile {
     /// Falls back to `Archive` when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_tier: Option<crate::Tier>,
+    /// Explicit override for the Coralogix web console base URL used to build
+    /// "View in Coralogix" links. Include the team subdomain - console links
+    /// resolve to a team, and the team name is not always derivable
+    /// automatically.
+    ///
+    /// When unset, the CLI resolves this automatically via
+    /// `GET /identity/whoami` (see `identity::resolve_team_url`). If that
+    /// lookup fails or returns no usable URL, no console link is printed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console_url: Option<String>,
+    /// Machine-managed cache of the team console base URL resolved via
+    /// `GET /identity/whoami`, persisted here (best-effort) so that repeated
+    /// invocations don't re-hit the identity endpoint just to print a "View in
+    /// Coralogix" link. Like `oauth_tokens`, this is written by `cx`, not the
+    /// user, and is ignored whenever an explicit `console_url` override is set.
+    /// Expired after [`CONSOLE_URL_CACHE_TTL_DAYS`]; see
+    /// [`load_cached_console_url`] / [`cache_console_url`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_console_url: Option<String>,
+    /// When `cached_console_url` was last resolved. Used to expire the cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_console_url_at: Option<DateTime<Utc>>,
 }
 
 /// Resolved configuration ready for use at runtime.
@@ -317,11 +386,23 @@ pub struct ResolvedConfig {
     /// The profile name this config was resolved from.
     pub profile_name: String,
     pub api_key: String,
+    /// Authentication mechanism that produced the bearer token.
+    pub auth_kind: AuthKind,
     pub endpoint: String,
     /// Default storage tier for DataPrime queries, resolved from the profile
     /// config. Falls back to `Archive` when the profile does not specify one.
     pub default_tier: crate::Tier,
     pub verbose: bool,
+    /// Explicit console base URL override from `Profile::console_url`, with
+    /// any trailing slash trimmed. Takes precedence over the automatic
+    /// `GET /identity/whoami`-based resolution.
+    pub console_url: Option<String>,
+    /// True when `api_key` came from a `--api-key`/`CX_API_KEY` override
+    /// rather than the profile file's own stored credentials. When set, the
+    /// profile's `console_url` and cached console URL must not be read or
+    /// written, since they were resolved against a different team's
+    /// credentials than the ones actually in use for this run.
+    pub credentials_overridden: bool,
 }
 
 /// Returns the cx config directory: `~/.cx/`
@@ -449,8 +530,11 @@ async fn resolve_single(
                 profile_name: profile_name.to_string(),
                 endpoint: region.api_endpoint().to_string(),
                 api_key: key.to_string(),
+                auth_kind: AuthKind::ApiKey,
                 default_tier: crate::Tier::Archive,
                 verbose,
+                console_url: None,
+                credentials_overridden: true,
             });
         }
     }
@@ -462,53 +546,63 @@ async fn resolve_single(
     }
 
     // CLI-level api_key_override (already filtered by main.rs) wins over profile creds.
-    let bearer = if let Some(key) = api_key_override {
-        key.to_string()
+    let auth_kind = if api_key_override.is_some() {
+        AuthKind::ApiKey
     } else {
-        match profile.auth {
-            AuthKind::ApiKey => match profile.credential_storage {
-                CredentialStorage::OsStore => keyring_store::get_secret(profile_name, "api_key")?,
-                CredentialStorage::File => profile.api_key.clone(),
-            }
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No API key found for profile '{profile_name}'.\n\
-                         Run `cx profiles add {profile_name}` to set it up."
-                )
-            })?,
-            AuthKind::OAuth => {
-                let region_name = profile.region.to_string();
-                let base_url = profile
-                    .oauth_base_url
-                    .clone()
-                    .unwrap_or_else(|| profile.region.api_endpoint().to_string());
-                let client_id = profile
-                    .oauth_client_id
-                    .clone()
-                    .or_else(|| oauth::client_id_for_region(&region_name).map(str::to_string))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "No OAuth client ID configured for profile '{profile_name}' \
-                             (region: {region_name}).\n\
-                             Run `cx profiles add {profile_name}` to reconfigure."
-                        )
-                    })?;
-                let storage = profile.credential_storage;
-                let (bearer, refreshed) = oauth::resolve_token(
-                    profile_name,
-                    &base_url,
-                    &client_id,
-                    storage,
-                    profile.oauth_tokens.as_ref(),
-                )
-                .await?;
-                if let Some(new_tokens) = refreshed {
-                    // File-storage profile: persist refreshed tokens back to disk.
-                    profile.oauth_tokens = Some(new_tokens);
-                    save_profile(profile_name, &profile)?;
+        profile.auth
+    };
+    let bearer = match auth_kind {
+        AuthKind::ApiKey => {
+            if let Some(key) = api_key_override {
+                key.to_string()
+            } else {
+                match profile.credential_storage {
+                    CredentialStorage::OsStore => {
+                        keyring_store::get_secret(profile_name, "api_key")?
+                    }
+                    CredentialStorage::File => profile.api_key.clone(),
                 }
-                bearer
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No API key found for profile '{profile_name}'.\n\
+                             Run `cx profiles add {profile_name}` to set it up."
+                    )
+                })?
             }
+        }
+        AuthKind::OAuth => {
+            debug_assert!(api_key_override.is_none());
+            let region_name = profile.region.to_string();
+            let base_url = profile
+                .oauth_base_url
+                .clone()
+                .unwrap_or_else(|| profile.region.api_endpoint().to_string());
+            let client_id = profile
+                .oauth_client_id
+                .clone()
+                .or_else(|| oauth::client_id_for_region(&region_name).map(str::to_string))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No OAuth client ID configured for profile '{profile_name}' \
+                         (region: {region_name}).\n\
+                         Run `cx profiles add {profile_name}` to reconfigure."
+                    )
+                })?;
+            let storage = profile.credential_storage;
+            let (bearer, refreshed) = oauth::resolve_token(
+                profile_name,
+                &base_url,
+                &client_id,
+                storage,
+                profile.oauth_tokens.as_ref(),
+            )
+            .await?;
+            if let Some(new_tokens) = refreshed {
+                // File-storage profile: persist refreshed tokens back to disk.
+                profile.oauth_tokens = Some(new_tokens);
+                save_profile(profile_name, &profile)?;
+            }
+            bearer
         }
     };
 
@@ -516,8 +610,14 @@ async fn resolve_single(
         profile_name: profile_name.to_string(),
         endpoint: profile.region.api_endpoint().to_string(),
         api_key: bearer,
+        auth_kind,
         default_tier: profile.default_tier.unwrap_or(crate::Tier::Archive),
         verbose,
+        console_url: profile
+            .console_url
+            .as_deref()
+            .map(|s| s.trim_end_matches('/').to_string()),
+        credentials_overridden: api_key_override.is_some(),
     })
 }
 
@@ -574,6 +674,39 @@ pub fn save_profile(name: &str, profile: &Profile) -> Result<()> {
     Ok(())
 }
 
+/// Return the profile's cached team console base URL, but only if it is still
+/// fresh (resolved within [`CONSOLE_URL_CACHE_TTL_DAYS`]).
+///
+/// Best-effort and silent: returns `None` for a missing/unreadable profile
+/// (e.g. env-only mode, where there is no profile file to cache against), an
+/// absent cache, or a stale entry - all of which simply fall back to a live
+/// `GET /identity/whoami` lookup.
+pub fn load_cached_console_url(profile_name: &str) -> Option<String> {
+    let profile = load_profile(profile_name).ok()?;
+    let cached_at = profile.cached_console_url_at?;
+    if Utc::now() - cached_at < Duration::days(CONSOLE_URL_CACHE_TTL_DAYS) {
+        profile.cached_console_url
+    } else {
+        None
+    }
+}
+
+/// Persist a freshly-resolved team console base URL into the profile file so
+/// future invocations can skip the `GET /identity/whoami` round-trip.
+///
+/// Best-effort and silent, mirroring the OAuth-token write-back in
+/// `resolve_single`: any failure (no profile file - e.g. env-only mode - or an
+/// unwritable config dir) is ignored, since a console link is a "nice to have"
+/// that must never fail an otherwise-successful command.
+pub fn cache_console_url(profile_name: &str, url: &str) {
+    let Ok(mut profile) = load_profile(profile_name) else {
+        return;
+    };
+    profile.cached_console_url = Some(url.to_string());
+    profile.cached_console_url_at = Some(Utc::now());
+    let _ = save_profile(profile_name, &profile);
+}
+
 // ── Managed completion helpers ────────────────────────────────────────────────
 
 /// Returns `true` when at least one completion file is tracked in the config.
@@ -615,6 +748,54 @@ pub fn upsert_managed_completion(shell: &str, path: PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── OutputFormat: toon canonical + agents backward-compat alias ─────────────
+
+    #[test]
+    fn output_format_as_str_is_toon() {
+        assert_eq!(OutputFormat::Toon.as_str(), "toon");
+        assert_eq!(OutputFormat::Toon.to_string(), "toon");
+    }
+
+    #[test]
+    fn output_format_serializes_as_toon() {
+        // New configs are written with the canonical `toon` spelling.
+        let json = serde_json::to_string(&OutputFormat::Toon).unwrap();
+        assert_eq!(json, "\"toon\"");
+    }
+
+    #[test]
+    fn output_format_deserializes_toon_and_agents_alias() {
+        // Canonical value.
+        let toon: OutputFormat = serde_json::from_str("\"toon\"").unwrap();
+        assert_eq!(toon, OutputFormat::Toon);
+        // Backward compat: existing profiles/config with `default_output_format = "agents"`
+        // must still deserialize rather than fail.
+        let agents: OutputFormat = serde_json::from_str("\"agents\"").unwrap();
+        assert_eq!(agents, OutputFormat::Toon);
+    }
+
+    #[test]
+    fn output_format_profile_toml_accepts_agents_alias() {
+        // Simulate an on-disk profile that predates the rename.
+        let profile: Profile =
+            toml::from_str("region = \"eu2\"\ndefault_output_format = \"agents\"\n").unwrap();
+        assert_eq!(profile.default_output_format, Some(OutputFormat::Toon));
+    }
+
+    #[test]
+    fn output_format_clap_parses_toon_and_agents_alias() {
+        use clap::ValueEnum;
+        assert_eq!(
+            OutputFormat::from_str("toon", true).unwrap(),
+            OutputFormat::Toon
+        );
+        // `-o agents` on the CLI still resolves to the Toon variant.
+        assert_eq!(
+            OutputFormat::from_str("agents", true).unwrap(),
+            OutputFormat::Toon
+        );
+    }
 
     // ── list_profile_names_from ────────────────────────────────────────────────
 
@@ -710,8 +891,11 @@ default_profile = "my-profile"
         let cfg = ResolvedConfig {
             profile_name: "prod".to_string(),
             api_key: "k".to_string(),
+            auth_kind: AuthKind::ApiKey,
             endpoint: "https://api.eu2.coralogix.com".to_string(),
             default_tier: crate::Tier::Archive,
+            console_url: None,
+            credentials_overridden: false,
         };
         assert_eq!(cfg.profile_name, "prod");
     }
@@ -724,6 +908,48 @@ default_profile = "my-profile"
     #[test]
     fn region_api_endpoint_us1() {
         assert_eq!(Region::Us1.api_endpoint(), "https://api.us1.coralogix.com");
+    }
+
+    #[test]
+    fn region_app_url_template_eu2() {
+        assert_eq!(
+            Region::Eu2.app_url_template(),
+            Some("app.eu2.coralogix.com")
+        );
+    }
+
+    #[test]
+    fn region_app_url_template_us2_uses_cx498() {
+        assert_eq!(
+            Region::Us2.app_url_template(),
+            Some("app.cx498.coralogix.com")
+        );
+    }
+
+    #[test]
+    fn region_app_url_template_custom_is_none() {
+        assert_eq!(
+            Region::Custom("https://api.myenv.example.com".into()).app_url_template(),
+            None
+        );
+    }
+
+    #[test]
+    fn every_named_region_has_an_app_url_template() {
+        let cases: &[(Region, &str)] = &[
+            (Region::Us1, "app.coralogix.us"),
+            (Region::Us2, "app.cx498.coralogix.com"),
+            (Region::Us3, "app.us3.coralogix.com"),
+            (Region::Eu1, "coralogix.com"),
+            (Region::Eu2, "app.eu2.coralogix.com"),
+            (Region::Ap1, "app.coralogix.in"),
+            (Region::Ap2, "app.coralogixsg.com"),
+            (Region::Ap3, "app.ap3.coralogix.com"),
+            (Region::Stg1, "app.stg1.coralogix.net"),
+        ];
+        for (region, expected) in cases {
+            assert_eq!(region.app_url_template(), Some(*expected), "{region}");
+        }
     }
 
     #[test]
@@ -767,6 +993,9 @@ api_key = "mykey"
             oauth_tokens: None,
             default_output_format: None,
             default_tier: None,
+            console_url: None,
+            cached_console_url: None,
+            cached_console_url_at: None,
         };
         let toml = toml::to_string_pretty(&profile).unwrap();
         let restored: Profile = toml::from_str(&toml).unwrap();
@@ -797,6 +1026,9 @@ api_key = "mykey"
             }),
             default_output_format: None,
             default_tier: None,
+            console_url: None,
+            cached_console_url: None,
+            cached_console_url_at: None,
         };
         let toml = toml::to_string_pretty(&profile).unwrap();
         let restored: Profile = toml::from_str(&toml).unwrap();
@@ -822,6 +1054,9 @@ api_key = "mykey"
             oauth_tokens: None,
             default_output_format: None,
             default_tier: None,
+            console_url: None,
+            cached_console_url: None,
+            cached_console_url_at: None,
         };
         let toml = toml::to_string_pretty(&profile).unwrap();
         let restored: Profile = toml::from_str(&toml).unwrap();
@@ -911,6 +1146,9 @@ api_key = "mykey"
                 oauth_tokens: None,
                 default_output_format: None,
                 default_tier: None,
+                console_url: None,
+                cached_console_url: None,
+                cached_console_url_at: None,
             };
             save_profile(name, &profile).unwrap();
         }
@@ -948,6 +1186,9 @@ api_key = "mykey"
             oauth_tokens: None,
             default_output_format: None,
             default_tier: None,
+            console_url: None,
+            cached_console_url: None,
+            cached_console_url_at: None,
         };
         save_profile("default", &profile).unwrap();
 
@@ -971,6 +1212,9 @@ api_key = "mykey"
             oauth_tokens: None,
             default_output_format: None,
             default_tier: None,
+            console_url: None,
+            cached_console_url: None,
+            cached_console_url_at: None,
         };
         save_profile(name, &profile).unwrap();
 
@@ -995,6 +1239,9 @@ api_key = "mykey"
             oauth_tokens: None,
             default_output_format: None,
             default_tier: None,
+            console_url: None,
+            cached_console_url: None,
+            cached_console_url_at: None,
         };
         save_profile(name, &profile).unwrap();
 
@@ -1019,11 +1266,90 @@ api_key = "mykey"
             oauth_tokens: None,
             default_output_format: None,
             default_tier: None,
+            console_url: None,
+            cached_console_url: None,
+            cached_console_url_at: None,
         };
         save_profile(name, &profile).unwrap();
 
         let result = resolve_single(name, None, None).await;
         assert!(result.is_err());
+
+        let _ = std::fs::remove_file(profile_file(name).unwrap());
+    }
+
+    // ── Console URL cache ──────────────────────────────────────────────────────
+
+    /// A profile that doesn't exist on disk (e.g. env-only mode) has no cache
+    /// to read - this must be a silent `None`, not an error, so the caller
+    /// falls back to a live `/identity/whoami` lookup. Read-only, so it needs
+    /// no filesystem write access.
+    #[test]
+    fn load_cached_console_url_none_for_missing_profile() {
+        assert_eq!(
+            load_cached_console_url("cx_unittest_definitely_missing_profile_xyz"),
+            None
+        );
+    }
+
+    fn profile_with_cache(cached_at: Option<DateTime<Utc>>) -> Profile {
+        Profile {
+            auth: AuthKind::ApiKey,
+            credential_storage: CredentialStorage::File,
+            api_key: Some("k".to_string()),
+            region: Region::Eu1,
+            label: None,
+            oauth_client_id: None,
+            oauth_base_url: None,
+            oauth_tokens: None,
+            default_output_format: None,
+            default_tier: None,
+            console_url: None,
+            cached_console_url: Some("https://cached.app.eu2.coralogix.com".to_string()),
+            cached_console_url_at: cached_at,
+        }
+    }
+
+    #[test]
+    #[ignore = "requires write access to ~/.cx; run with `cargo test -- --ignored`"]
+    fn cache_console_url_round_trips() {
+        let name = "cx_inttest_console_cache_roundtrip";
+        // Seed a profile so cache_console_url has a file to write into.
+        save_profile(name, &profile_with_cache(None)).unwrap();
+
+        cache_console_url(name, "https://fresh.app.eu2.coralogix.com");
+        assert_eq!(
+            load_cached_console_url(name),
+            Some("https://fresh.app.eu2.coralogix.com".to_string())
+        );
+
+        let _ = std::fs::remove_file(profile_file(name).unwrap());
+    }
+
+    #[test]
+    #[ignore = "requires write access to ~/.cx; run with `cargo test -- --ignored`"]
+    fn load_cached_console_url_ignores_stale_entry() {
+        let name = "cx_inttest_console_cache_stale";
+        let stale = Utc::now() - Duration::days(CONSOLE_URL_CACHE_TTL_DAYS + 1);
+        save_profile(name, &profile_with_cache(Some(stale))).unwrap();
+
+        // Present on disk, but older than the TTL -> treated as absent.
+        assert_eq!(load_cached_console_url(name), None);
+
+        let _ = std::fs::remove_file(profile_file(name).unwrap());
+    }
+
+    #[test]
+    #[ignore = "requires write access to ~/.cx; run with `cargo test -- --ignored`"]
+    fn load_cached_console_url_returns_fresh_entry() {
+        let name = "cx_inttest_console_cache_fresh";
+        let fresh = Utc::now() - Duration::days(CONSOLE_URL_CACHE_TTL_DAYS - 1);
+        save_profile(name, &profile_with_cache(Some(fresh))).unwrap();
+
+        assert_eq!(
+            load_cached_console_url(name),
+            Some("https://cached.app.eu2.coralogix.com".to_string())
+        );
 
         let _ = std::fs::remove_file(profile_file(name).unwrap());
     }

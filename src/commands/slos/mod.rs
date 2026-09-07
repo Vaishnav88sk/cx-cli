@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use toon_format::encode_default as toon_encode;
 
 use crate::config::OutputFormat;
-use crate::execution::{fan_out, ExecutionTarget};
+use crate::execution::{fan_out, report_errors_and_collect_successes, ExecutionTarget};
 use crate::render;
 use api::{Slo, SlosApi};
 
@@ -67,21 +67,24 @@ pub async fn run_list(targets: &[Arc<ExecutionTarget>], output: OutputFormat) ->
 
     let mut all_json: Vec<Value> = Vec::new();
     let mut all_items: Vec<(String, Slo)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                for slo in resp.slos {
-                    all_json.push(slo_to_json(&slo, include_profile, &profile));
-                    all_items.push((profile.clone(), slo));
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        // Print the SLOs list page link to stderr once per profile. Skip
+        // when there are no SLOs, since there's nothing to view.
+        if !resp.slos.is_empty() {
+            crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                crate::console_url::slos_url(b)
+            })
+            .await;
+        }
+        for slo in resp.slos {
+            all_json.push(slo_to_json(&slo, include_profile, &profile));
+            all_items.push((profile.clone(), slo));
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json(&all_json)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon =
                 toon_encode(&all_json).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -135,21 +138,16 @@ pub async fn run_get(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut val) => {
-                if include_profile {
-                    render::tag_get_result(&mut val, &profile);
-                }
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, mut val) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut val, &profile);
         }
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -205,32 +203,29 @@ pub async fn run_create(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                if let Some(slo) = resp.slo {
-                    let name = slo.display_name().to_string();
-                    let id = slo.id.as_deref().unwrap_or("unknown");
-                    eprintln!(
-                        "{}",
-                        format!("Created SLO '{name}' (ID: {id}) in profile '{profile}'.").green()
-                    );
-                    all_results.push(slo_to_json(&slo, include_profile, &profile));
-                } else {
-                    eprintln!(
-                        "{}",
-                        format!("SLO created in profile '{profile}' but response was empty.")
-                            .yellow()
-                    );
-                }
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        if let Some(slo) = resp.slo {
+            let name = slo.display_name().to_string();
+            render::print_created("Created", "SLO", Some(&name), slo.id.as_deref(), &profile);
+            if let Some(id) = slo.id.as_deref() {
+                crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                    crate::console_url::slo_url(b, id)
+                })
+                .await;
             }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+            let slo_json = slo_to_json(&slo, include_profile, &profile);
+            all_results.push(slo_json);
+        } else {
+            eprintln!(
+                "{}",
+                format!("SLO created in profile '{profile}' but response was empty.").yellow()
+            );
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -262,32 +257,29 @@ pub async fn run_update(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                if let Some(slo) = resp.slo {
-                    let name = slo.display_name().to_string();
-                    let id = slo.id.as_deref().unwrap_or("unknown");
-                    eprintln!(
-                        "{}",
-                        format!("Updated SLO '{name}' (ID: {id}) in profile '{profile}'.").green()
-                    );
-                    all_results.push(slo_to_json(&slo, include_profile, &profile));
-                } else {
-                    eprintln!(
-                        "{}",
-                        format!("SLO updated in profile '{profile}' but response was empty.")
-                            .yellow()
-                    );
-                }
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        if let Some(slo) = resp.slo {
+            let name = slo.display_name().to_string();
+            render::print_created("Updated", "SLO", Some(&name), slo.id.as_deref(), &profile);
+            if let Some(id) = slo.id.as_deref() {
+                crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                    crate::console_url::slo_url(b, id)
+                })
+                .await;
             }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+            let slo_json = slo_to_json(&slo, include_profile, &profile);
+            all_results.push(slo_json);
+        } else {
+            eprintln!(
+                "{}",
+                format!("SLO updated in profile '{profile}' but response was empty.").yellow()
+            );
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -313,14 +305,11 @@ pub async fn run_delete(targets: &[Arc<ExecutionTarget>], id: &str) -> Result<()
     })
     .await;
 
-    for (profile, result) in per_profile {
-        match result {
-            Ok(()) => eprintln!(
-                "{}",
-                format!("SLO {id} deleted in profile '{profile}'.").green()
-            ),
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, ()) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!("SLO {id} deleted in profile '{profile}'.").green()
+        );
     }
 
     Ok(())

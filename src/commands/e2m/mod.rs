@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use toon_format::encode_default as toon_encode;
 
 use crate::config::OutputFormat;
-use crate::execution::{fan_out, ExecutionTarget};
+use crate::execution::{fan_out, report_errors_and_collect_successes, ExecutionTarget};
 use crate::render;
 use api::{E2mApi, E2mDefinition};
 
@@ -64,21 +64,25 @@ pub async fn run_list(targets: &[Arc<ExecutionTarget>], output: OutputFormat) ->
 
     let mut all_json: Vec<Value> = Vec::new();
     let mut all_items: Vec<(String, E2mDefinition)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                for def in resp.e2m {
-                    all_json.push(e2m_to_json(&def, include_profile, &profile));
-                    all_items.push((profile.clone(), def));
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        // Print the E2M definitions list page link to stderr once per
+        // profile. Skip when there are no definitions, since there's
+        // nothing to view.
+        if !resp.e2m.is_empty() {
+            crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                crate::console_url::e2m_definitions_url(b)
+            })
+            .await;
+        }
+        for def in resp.e2m {
+            all_json.push(e2m_to_json(&def, include_profile, &profile));
+            all_items.push((profile.clone(), def));
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json(&all_json)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon =
                 toon_encode(&all_json).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -132,21 +136,20 @@ pub async fn run_get(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut val) => {
-                if include_profile {
-                    render::tag_get_result(&mut val, &profile);
-                }
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, mut val) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut val, &profile);
         }
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::e2m_url(b, &id)
+        })
+        .await;
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -207,26 +210,24 @@ pub async fn run_create(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                if let Some(def) = resp.e2m {
-                    let name = def.display_name().to_string();
-                    let id = def.id.as_deref().unwrap_or("unknown");
-                    eprintln!(
-                        "{}",
-                        format!("Created E2M '{name}' (ID: {id}) in profile '{profile}'.").green()
-                    );
-                    all_results.push(e2m_to_json(&def, include_profile, &profile));
-                }
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        if let Some(def) = resp.e2m {
+            let name = def.display_name().to_string();
+            render::print_created("Created", "E2M", Some(&name), def.id.as_deref(), &profile);
+            if let Some(id) = def.id.as_deref() {
+                crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                    crate::console_url::e2m_url(b, id)
+                })
+                .await;
             }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+            let val = e2m_to_json(&def, include_profile, &profile);
+            all_results.push(val);
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -258,26 +259,24 @@ pub async fn run_update(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                if let Some(def) = resp.e2m {
-                    let name = def.display_name().to_string();
-                    let id = def.id.as_deref().unwrap_or("unknown");
-                    eprintln!(
-                        "{}",
-                        format!("Updated E2M '{name}' (ID: {id}) in profile '{profile}'.").green()
-                    );
-                    all_results.push(e2m_to_json(&def, include_profile, &profile));
-                }
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        if let Some(def) = resp.e2m {
+            let name = def.display_name().to_string();
+            render::print_created("Updated", "E2M", Some(&name), def.id.as_deref(), &profile);
+            if let Some(id) = def.id.as_deref() {
+                crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                    crate::console_url::e2m_url(b, id)
+                })
+                .await;
             }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+            let val = e2m_to_json(&def, include_profile, &profile);
+            all_results.push(val);
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -303,14 +302,11 @@ pub async fn run_delete(targets: &[Arc<ExecutionTarget>], id: &str) -> Result<()
     })
     .await;
 
-    for (profile, result) in per_profile {
-        match result {
-            Ok(()) => eprintln!(
-                "{}",
-                format!("E2M {id} deleted in profile '{profile}'.").green()
-            ),
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, ()) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!("E2M {id} deleted in profile '{profile}'.").green()
+        );
     }
 
     Ok(())
@@ -329,20 +325,15 @@ pub async fn run_labels_cardinality(
     .await;
 
     let mut all_json: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                for label in resp.labels {
-                    all_json.push(label);
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (_profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        for label in resp.labels {
+            all_json.push(label);
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json(&all_json)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon =
                 toon_encode(&all_json).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -373,27 +364,22 @@ pub async fn run_limits(targets: &[Arc<ExecutionTarget>], output: OutputFormat) 
     .await;
 
     let mut all_json: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                let mut v = json!({
-                    "limit": resp.limit,
-                    "used": resp.used,
-                });
-                if include_profile {
-                    if let Value::Object(ref mut m) = v {
-                        m.insert("profile".to_string(), Value::String(profile.clone()));
-                    }
-                }
-                all_json.push(v);
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        let mut v = json!({
+            "limit": resp.limit,
+            "used": resp.used,
+        });
+        if include_profile {
+            if let Value::Object(ref mut m) = v {
+                m.insert("profile".to_string(), Value::String(profile.clone()));
             }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
         }
+        all_json.push(v);
     }
 
     match output {
         OutputFormat::Json => render::render_json(&all_json)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon =
                 toon_encode(&all_json).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");

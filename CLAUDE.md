@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`cx` - a Rust CLI for querying Coralogix observability data (logs, metrics, traces, dashboards, alerts) from the terminal. Supports multi-profile fan-out, multiple output formats (text/json/agents), and AI-optimized result spilling.
+`cx` - a Rust CLI for querying Coralogix observability data (logs, metrics, traces, dashboards, alerts) from the terminal. Supports multi-profile fan-out, multiple output formats (text/json/toon), and AI-optimized result spilling.
 
 ## Build & Development
 
@@ -20,7 +20,7 @@ cargo test --test e2e -- --ignored --test-threads=1   # E2E vs. Coralogix test t
 cargo run -- <args>                 # Run CLI in dev mode
 ```
 
-Rust toolchain is pinned to **1.94.1** via `rust-toolchain.toml`.
+Rust toolchain is pinned to **1.96.1** via `rust-toolchain.toml`.
 
 ## Command Hierarchy
 
@@ -39,10 +39,13 @@ Observe:
   dashboards         Manage dashboards and dashboard folders
   views              Manage saved views and view folders
   slos               Manage SLO definitions
+  infra              Query infrastructure resources and their data
+
+AI:
+  ai-center (risky)  Manage AI Center applications, evaluations, policies, and pricing
 
 Detect & Respond:
   alerts             Manage alert definitions and suppression rules
-  incidents          Manage and triage incidents
   cases              Manage and triage cases
 
 Notifications:
@@ -72,6 +75,7 @@ Agent:
 
 Local:
   profiles           Manage profiles (list, add, delete, set-default)
+  skills             Install or update the cx agent skills for coding agents
   cleanup            Remove stale temp files
 ```
 
@@ -83,6 +87,8 @@ Local:
 - `cx dashboards query-search --field <field-path>` — Find all queries referencing a specific field (e.g., `$d.http.status_code`)
 
 All use the Olly KB semantic-search-service API with gateway permission `legacy-archive-queries:Execute` (AAA id 40). See `olly-knowledge-base` `apps/semantic-search-service/AGENTS.md`.
+
+**`cx skills install`:** Installs the cx agent skills bundle by shelling out to the vercel-labs `skills` npx installer (`npx skills add coralogix/cx-cli/skills` — the `skills/` subdir, so the contributor-only dev skills under `.claude/skills/` are never installed for end users). By default it asks one question (global vs local scope, skipped by `--global`/`--local`), then runs fully non-interactively with agent auto-detection; `--agent <name>` overrides auto-detect, `--interactive` walks the installer's full flow. Requires Node.js/npx; the CLI is fully usable without skills. Logic lives in `src/commands/skills/mod.rs`.
 
 **Agent discovery:** `cx schema` outputs the full command tree (commands, subcommands, flags, descriptions) as JSON. Agents should call `cx schema` to discover available commands rather than parsing help text.
 
@@ -99,7 +105,7 @@ All use the Olly KB semantic-search-service API with gateway permission `legacy-
 - `integrations` = extensions + contextual-data
 - `iam` = api-keys + roles + scopes + users + team-groups + ip-access
 
-**Risky commands:** `iam` and `archive` are marked `(risky)` in help output. All write operations (create, update, delete, enable, disable, set, set-status) under these commands require interactive confirmation. Pass `--yes` to skip the prompt (e.g., in scripts or CI). Non-interactive terminals without `--yes` get a clear error. The confirmation logic lives in `src/safety.rs`.
+**Risky commands:** `iam`, `archive`, and `ai-center` are marked `(risky)` in help output. All write operations (create, update, delete, enable, disable, set, set-status) under these commands require interactive confirmation. Pass `--yes` to skip the prompt (e.g., in scripts or CI). Non-interactive terminals without `--yes` get a clear error. The confirmation logic lives in `src/safety.rs`.
 
 ## Architecture
 
@@ -110,7 +116,7 @@ All use the Olly KB semantic-search-service API with gateway permission `legacy-
 3. **Target building** (`execution.rs`) - Each profile becomes an `ExecutionTarget` wrapping a `ResolvedConfig` + `CxClient`
 4. **Fan-out** (`execution.rs::fan_out`) - Runs the command handler concurrently across all targets
 5. **Result merging** (`execution.rs::merge_tagged_results`) - Combines per-profile results, tags rows with profile names when multi-profile
-6. **Output rendering** (`render.rs`) - Shared helpers for text tables, JSON, and TOON-encoded agents format
+6. **Output rendering** (`render.rs`) - Shared helpers for text tables, JSON, and TOON-encoded toon output
 7. **Spilling** (`spill.rs`) - If output exceeds `max_dataprime_direct_output_size` (default 100KiB), writes to a temp file and returns the path
 
 ### Layout
@@ -128,8 +134,8 @@ This per-command layout drives `CODEOWNERS`: each domain in the file maps direct
 - **`src/commands/metrics/api.rs`** - PromQL queries (instant, range, search, labels)
 - **`src/commands/<command>/mod.rs`** - Per-command handler (logs, metrics, spans, dashboards, alerts, notifications, webhooks, enrichments, parsing-rules, tco, usage, archive, integrations, iam, slos, search-fields, profiles, cleanup, dataprime docs, schema)
 - **`src/time.rs`** - Parses relative timestamps (`now-1h`, `now - 3d`) and ISO-8601
-- **`src/render.rs`** - Shared rendering helpers (`render_table`, `render_json`, `bool_display`, etc.) for text/JSON/agents output
-- **`src/spill.rs`** - Large result spilling + `transform_for_agents()` (shrinks output for AI consumers)
+- **`src/render.rs`** - Shared rendering helpers (`render_table`, `render_json`, `bool_display`, etc.) for text/JSON/toon output
+- **`src/spill.rs`** - Large result spilling + `transform_for_toon()` (shrinks output for AI consumers)
 - **`src/tier.rs`** - Storage tier enum (FrequentSearch vs Archive)
 - **`src/error.rs`** - `CxError` enum (Auth, Api, Http, Json, Io)
 
@@ -145,13 +151,13 @@ Config lives in `~/.cx/`. Environment variables `CX_PROFILE`, `CX_API_KEY`, `CX_
 
 ### Skills
 
-`skills/` contains Claude Code skill plugins for AI-driven observability investigation. Eight skills cover all CLI commands: `cx-telemetry-querying` (logs, spans, metrics, RUM, DataPrime — gateway with pillar-specific reference files), `cx-alerts`, `cx-dashboards`, `cx-incident-management`, `cx-cost-optimization`, `cx-data-pipeline`, `cx-observability-setup`, and `cx-platform-admin`. Shared reference files (DataPrime syntax, PromQL guidelines, telemetry-pillar how-tos) live in `skills/shared/` and are distributed to consuming skills via `scripts/sync-shared-references.sh`.
+`skills/` contains Claude Code skill plugins for AI-driven observability investigation. Ten skills cover all CLI commands: `cx-telemetry-querying` (logs, spans, metrics, RUM, DataPrime — gateway with pillar-specific reference files), `cx-alerts`, `cx-cases`, `cx-slos`, `cx-dashboards`, `cx-infra`, `cx-cost-optimization`, `cx-data-pipeline`, `cx-observability-setup`, and `cx-platform-admin`. Shared reference files (DataPrime syntax, PromQL guidelines, telemetry-pillar how-tos) live in `skills/shared/` and are distributed to consuming skills via `scripts/sync-shared-references.sh`.
 
 ### Documentation
 
 **Contributor guides:** [architecture](contributing/architecture.md), [adding a command](contributing/adding-a-command.md), [adding a skill](contributing/adding-a-skill.md), [development](contributing/development.md)
 
-**Reference docs:** [configuration](docs/configuration.md), [agents output format](docs/agents-output.md), [multi-profile fan-out](docs/multi-profile.md), [time syntax](docs/time-syntax.md)
+**Reference docs:** [configuration](docs/configuration.md), [TOON output format](docs/toon-output.md), [multi-profile fan-out](docs/multi-profile.md), [time syntax](docs/time-syntax.md)
 
 ## Contributing
 
@@ -186,9 +192,9 @@ Which CLI commands have user-facing skills in `skills/`:
 | `cx tco` | `cx-cost-optimization` | Covered |
 | `cx retentions` | `cx-cost-optimization` | Covered |
 | `cx archive` | `cx-cost-optimization` | Covered |
-| `cx incidents` | `cx-incident-management` | Covered |
 | `cx cases` | `cx-cases` | Covered |
-| `cx slos` | `cx-incident-management` | Covered |
+| `cx ai-center` | `cx-ai-center` | Covered (loads `ai-center-queries.md` + `dataprime-reference.md` + `spans-querying.md`) |
+| `cx slos` | `cx-slos` | Covered |
 | `cx parsing-rules` | `cx-data-pipeline` | Covered |
 | `cx enrichments` | `cx-data-pipeline` | Covered |
 | `cx e2m` | `cx-data-pipeline` | Covered |
@@ -200,7 +206,9 @@ Which CLI commands have user-facing skills in `skills/`:
 | `cx integrations` | `cx-observability-setup` | Covered |
 | `cx schema` | `cx-telemetry-querying` | Covered (via gateway) |
 | `cx olly` | `cx-olly` | Covered |
+| `cx infra` | `cx-infra` | Covered |
 | `cx profiles` | - | Local command |
+| `cx skills` | - | Local command (installs the skills in this table) |
 | `cx cleanup` | - | Local command |
 
 ### Testing Expectations

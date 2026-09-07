@@ -7,9 +7,8 @@ use colored::Colorize;
 use serde_json::{json, Value};
 use toon_format::encode_default as toon_encode;
 
-use crate::commands::saml::api::SamlApi;
 use crate::config::OutputFormat;
-use crate::execution::{fan_out, ExecutionTarget};
+use crate::execution::{fan_out, report_errors_and_collect_successes, ExecutionTarget};
 use crate::render;
 use api::{User, UsersApi};
 
@@ -46,24 +45,6 @@ fn read_from_file(path: &str) -> Result<Value> {
     Ok(serde_json::from_str(&raw)?)
 }
 
-async fn resolve_team_id(client: &crate::api_client::CxClient) -> anyhow::Result<String> {
-    let saml = SamlApi::new(client);
-    let config = saml.get_config().await.map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("Permission denied") || msg.contains("Authentication failed") {
-            anyhow::anyhow!(
-                "Cannot resolve team ID: API key lacks SAML scope (required by the users API)"
-            )
-        } else {
-            anyhow::anyhow!("Failed to resolve team ID from SAML config: {e}")
-        }
-    })?;
-    config
-        .team_id
-        .map(|id| id.to_string())
-        .ok_or_else(|| anyhow::anyhow!("SAML config returned no team ID"))
-}
-
 pub async fn run_search(
     targets: &[Arc<ExecutionTarget>],
     query: Option<&str>,
@@ -87,7 +68,7 @@ pub async fn run_search(
         let page_token = page_token.clone();
         async move {
             let api = UsersApi::new(&t.client);
-            let team_id = resolve_team_id(&t.client).await?;
+            let team_id = crate::identity::resolve_team_id(&t.client).await?;
             let team_id = team_id.as_str();
             let mut params: Vec<(&str, String)> = Vec::new();
             if let Some(ref q) = query {
@@ -96,40 +77,46 @@ pub async fn run_search(
             if let Some(ref s) = status {
                 params.push(("status", s.clone()));
             }
-            if let Some(ref ps) = page_size {
-                params.push(("pageSize", ps.clone()));
-            }
+            // pageSize is required — the server returns an empty list without it.
+            params.push((
+                "pageSize",
+                page_size.clone().unwrap_or_else(|| "300".to_string()),
+            ));
             if let Some(ref pt) = page_token {
                 params.push(("pageToken", pt.clone()));
             }
             let params_refs: Vec<(&str, &str)> =
                 params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            if params_refs.is_empty() {
-                Ok(api.search(team_id).await?)
-            } else {
-                Ok(api.search_with_params(team_id, &params_refs).await?)
-            }
+            Ok(api.search_with_params(team_id, &params_refs).await?)
         }
     })
     .await;
 
     let mut all_json: Vec<Value> = Vec::new();
     let mut all_items: Vec<(String, User)> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                for user in resp.users {
-                    all_json.push(user_to_json(&user, include_profile, &profile));
-                    all_items.push((profile.clone(), user));
-                }
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        // One static team-members page link per profile - printed to stderr
+        // only. Not embedded in -o json/-o agents: unlike other list
+        // commands, this link isn't any individual user's own link, so
+        // tagging one arbitrary row with it is misleading rather than
+        // helpful. Skip printing entirely when the profile's result is
+        // empty, since there's nothing to view.
+        if !resp.users.is_empty() {
+            crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+                crate::console_url::iam_users_url(b)
+            })
+            .await;
+        }
+        for user in resp.users {
+            let user_json = user_to_json(&user, include_profile, &profile);
+            all_json.push(user_json);
+            all_items.push((profile.clone(), user));
         }
     }
 
     match output {
         OutputFormat::Json => render::render_json(&all_json)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon =
                 toon_encode(&all_json).map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -175,7 +162,7 @@ pub async fn run_get(
         let user_id = user_id.clone();
         async move {
             let api = UsersApi::new(&t.client);
-            let team_id = resolve_team_id(&t.client).await?;
+            let team_id = crate::identity::resolve_team_id(&t.client).await?;
             let team_id = team_id.as_str();
             Ok(api.get(team_id, &user_id).await?)
         }
@@ -183,21 +170,20 @@ pub async fn run_get(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut val) => {
-                if include_profile {
-                    render::tag_get_result(&mut val, &profile);
-                }
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, mut val) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut val, &profile);
         }
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::iam_users_url(b)
+        })
+        .await;
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -226,7 +212,7 @@ pub async fn run_create(
         let body = body.clone();
         async move {
             let api = UsersApi::new(&t.client);
-            let team_id = resolve_team_id(&t.client).await?;
+            let team_id = crate::identity::resolve_team_id(&t.client).await?;
             let team_id = team_id.as_str();
             api.create(team_id, &body).await?;
             Ok(())
@@ -234,20 +220,19 @@ pub async fn run_create(
     })
     .await;
 
-    for (profile, result) in per_profile {
-        match result {
-            Ok(()) => {
-                eprintln!(
-                    "{}",
-                    format!("Created user(s) in profile '{profile}'.").green()
-                );
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, ()) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!("Created user(s) in profile '{profile}'.").green()
+        );
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::iam_users_url(b)
+        })
+        .await;
     }
 
     match output {
-        OutputFormat::Json | OutputFormat::Agents | OutputFormat::Text => {}
+        OutputFormat::Json | OutputFormat::Toon | OutputFormat::Text => {}
     }
     Ok(())
 }
@@ -264,7 +249,7 @@ pub async fn run_update(
         let body = body.clone();
         async move {
             let api = UsersApi::new(&t.client);
-            let team_id = resolve_team_id(&t.client).await?;
+            let team_id = crate::identity::resolve_team_id(&t.client).await?;
             let team_id = team_id.as_str();
             Ok(api.update(team_id, &body).await?)
         }
@@ -272,32 +257,33 @@ pub async fn run_update(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(resp) => {
-                eprintln!(
-                    "{}",
-                    format!(
-                        "Updated {} user(s) in profile '{profile}'.",
-                        resp.user_account_ids.len()
-                    )
-                    .green()
-                );
-                let mut v = json!({ "user_account_ids": resp.user_account_ids });
-                if targets.len() > 1 {
-                    if let Value::Object(ref mut m) = v {
-                        m.insert("profile".to_string(), Value::String(profile.to_string()));
-                    }
-                }
-                all_results.push(v);
+    for (profile, resp) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!(
+                "Updated {} user(s) in profile '{profile}'.",
+                resp.user_account_ids.len()
+            )
+            .green()
+        );
+        let mut v = json!({ "user_account_ids": resp.user_account_ids });
+        if targets.len() > 1 {
+            if let Value::Object(ref mut m) = v {
+                m.insert("profile".to_string(), Value::String(profile.to_string()));
             }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
         }
+        crate::execution::emit_console_link_for_profile(
+            targets,
+            &profile,
+            crate::console_url::iam_users_url,
+        )
+        .await;
+        all_results.push(v);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -327,21 +313,22 @@ pub async fn run_set_status(
         let body = body.clone();
         async move {
             let api = UsersApi::new(&t.client);
-            let team_id = resolve_team_id(&t.client).await?;
+            let team_id = crate::identity::resolve_team_id(&t.client).await?;
             let team_id = team_id.as_str();
             api.update_statuses(team_id, &body).await?;
             Ok(())
         }
     })
     .await;
-    for (profile, result) in per_profile {
-        match result {
-            Ok(()) => eprintln!(
-                "{}",
-                format!("Updated user status in profile '{profile}'.").green()
-            ),
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
-        }
+    for (profile, ()) in report_errors_and_collect_successes(per_profile)? {
+        eprintln!(
+            "{}",
+            format!("Updated user status in profile '{profile}'.").green()
+        );
+        crate::execution::emit_console_link_for_profile(targets, &profile, |b| {
+            crate::console_url::iam_users_url(b)
+        })
+        .await;
     }
     Ok(())
 }

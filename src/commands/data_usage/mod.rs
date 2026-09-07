@@ -8,7 +8,7 @@ use serde_json::Value;
 use toon_format::encode_default as toon_encode;
 
 use crate::config::OutputFormat;
-use crate::execution::{fan_out, ExecutionTarget};
+use crate::execution::{fan_out, report_errors_and_collect_successes, ExecutionTarget};
 use crate::render;
 use api::DataUsageApi;
 
@@ -68,6 +68,33 @@ fn build_count_query_params(options: &CountCommandOptions<'_>) -> Result<Vec<(St
     Ok(params)
 }
 
+fn read_query_from_file(path: &str) -> Result<Value> {
+    let raw = if path == "-" {
+        eprintln!("{}", "Reading data usage query from stdin...".dimmed());
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    } else {
+        eprintln!(
+            "{}",
+            format!("Reading data usage query from {path}...").dimmed()
+        );
+        std::fs::read_to_string(path)?
+    };
+
+    parse_query(&raw)
+}
+
+fn parse_query(raw: &str) -> Result<Value> {
+    let query: Value = serde_json::from_str(raw)
+        .map_err(|error| anyhow::anyhow!("data usage query must be valid JSON: {error}"))?;
+    if !query.is_object() {
+        anyhow::bail!("data usage query must be a JSON object");
+    }
+    Ok(query)
+}
+
 pub async fn run_summary(
     targets: &[Arc<ExecutionTarget>],
     start: Option<&str>,
@@ -106,21 +133,22 @@ pub async fn run_summary(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut val) => {
-                if include_profile {
-                    render::tag_get_result(&mut val, &profile);
-                }
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, mut val) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut val, &profile);
         }
+        crate::execution::emit_console_link_for_profile(
+            targets,
+            &profile,
+            crate::console_url::usage_url,
+        )
+        .await;
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -182,21 +210,22 @@ pub async fn run_daily(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut val) => {
-                if include_profile {
-                    render::tag_get_result(&mut val, &profile);
-                }
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, mut val) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut val, &profile);
         }
+        crate::execution::emit_console_link_for_profile(
+            targets,
+            &profile,
+            crate::console_url::usage_url,
+        )
+        .await;
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -238,21 +267,22 @@ pub async fn run_logs_count(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut val) => {
-                if include_profile {
-                    render::tag_get_result(&mut val, &profile);
-                }
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, mut val) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut val, &profile);
         }
+        crate::execution::emit_console_link_for_profile(
+            targets,
+            &profile,
+            crate::console_url::usage_url,
+        )
+        .await;
+        all_results.push(val);
     }
 
     match options.output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -290,21 +320,22 @@ pub async fn run_spans_count(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut val) => {
-                if include_profile {
-                    render::tag_get_result(&mut val, &profile);
-                }
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, mut val) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut val, &profile);
         }
+        crate::execution::emit_console_link_for_profile(
+            targets,
+            &profile,
+            crate::console_url::usage_url,
+        )
+        .await;
+        all_results.push(val);
     }
 
     match options.output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -334,21 +365,22 @@ pub async fn run_export_status(
     .await;
 
     let mut all_results: Vec<Value> = Vec::new();
-    for (profile, result) in per_profile {
-        match result {
-            Ok(mut val) => {
-                if include_profile {
-                    render::tag_get_result(&mut val, &profile);
-                }
-                all_results.push(val);
-            }
-            Err(e) => eprintln!("{}", format!("error from profile '{profile}': {e:#}").red()),
+    for (profile, mut val) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut val, &profile);
         }
+        crate::execution::emit_console_link_for_profile(
+            targets,
+            &profile,
+            crate::console_url::usage_url,
+        )
+        .await;
+        all_results.push(val);
     }
 
     match output {
         OutputFormat::Json => render::render_json_auto(&all_results)?,
-        OutputFormat::Agents => {
+        OutputFormat::Toon => {
             let toon = toon_encode(&all_results)
                 .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
             println!("{toon}");
@@ -361,4 +393,164 @@ pub async fn run_export_status(
     }
 
     Ok(())
+}
+
+/// Fetch the tenant's supported Data Usage Query API dimensions and limits.
+pub async fn run_capabilities(
+    targets: &[Arc<ExecutionTarget>],
+    output: OutputFormat,
+) -> Result<()> {
+    eprintln!("{}", "Fetching data usage capabilities...".dimmed());
+
+    let include_profile = targets.len() > 1;
+    let per_profile = fan_out(targets, |t| async move {
+        let api = DataUsageApi::new(&t.client);
+        Ok(api.capabilities().await?)
+    })
+    .await;
+
+    let mut all_results = Vec::new();
+    for (profile, mut value) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut value, &profile);
+        }
+        crate::execution::emit_console_link_for_profile(
+            targets,
+            &profile,
+            crate::console_url::usage_url,
+        )
+        .await;
+        all_results.push(value);
+    }
+
+    match output {
+        OutputFormat::Json => render::render_json_auto(&all_results)?,
+        OutputFormat::Toon => {
+            let toon = toon_encode(&all_results)
+                .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
+            println!("{toon}");
+        }
+        OutputFormat::Text => {
+            for value in &all_results {
+                println!("{}", serde_json::to_string_pretty(value)?);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Submit a capabilities-derived Data Usage Query API request.
+pub async fn run_query(
+    targets: &[Arc<ExecutionTarget>],
+    from_file: Option<&str>,
+    inline_query: Option<&str>,
+    output: OutputFormat,
+) -> Result<()> {
+    let query = match (from_file, inline_query) {
+        (Some(path), None) => read_query_from_file(path)?,
+        (None, Some(raw)) => parse_query(raw)?,
+        _ => anyhow::bail!("provide exactly one of --from-file or --query"),
+    };
+    eprintln!("{}", "Querying data usage...".dimmed());
+
+    let include_profile = targets.len() > 1;
+    let per_profile = fan_out(targets, |t| {
+        let query = query.clone();
+        async move {
+            let api = DataUsageApi::new(&t.client);
+            Ok(api.query(&query).await?)
+        }
+    })
+    .await;
+
+    let mut all_results = Vec::new();
+    for (profile, mut value) in report_errors_and_collect_successes(per_profile)? {
+        if include_profile {
+            render::tag_get_result(&mut value, &profile);
+        }
+        crate::execution::emit_console_link_for_profile(
+            targets,
+            &profile,
+            crate::console_url::usage_url,
+        )
+        .await;
+        all_results.push(value);
+    }
+
+    match output {
+        OutputFormat::Json => render::render_json_auto(&all_results)?,
+        OutputFormat::Toon => {
+            let toon = toon_encode(&all_results)
+                .map_err(|e| anyhow::anyhow!("TOON encoding failed: {e}"))?;
+            println!("{toon}");
+        }
+        OutputFormat::Text => {
+            for value in &all_results {
+                println!("{}", serde_json::to_string_pretty(value)?);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_query, read_query_from_file};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn write_query(contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "cx-data-usage-query-unit-{}-{}.json",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn read_query_from_file_accepts_json_object() {
+        let path = write_query(r#"{"daily":{"relativeRange":"DAILY_RELATIVE_RANGE_LAST_7_DAYS"}}"#);
+        let query = read_query_from_file(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(
+            query["daily"]["relativeRange"],
+            "DAILY_RELATIVE_RANGE_LAST_7_DAYS"
+        );
+    }
+
+    #[test]
+    fn read_query_from_file_rejects_non_object_json() {
+        let path = write_query(r#"["not","a","query"]"#);
+        let error = read_query_from_file(path.to_str().unwrap()).unwrap_err();
+        std::fs::remove_file(path).unwrap();
+
+        assert!(error.to_string().contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn parse_query_accepts_inline_json_object() {
+        let query =
+            parse_query(r#"{"daily":{"relativeRange":"DAILY_RELATIVE_RANGE_LAST_7_DAYS"}}"#)
+                .unwrap();
+
+        assert_eq!(
+            query["daily"]["relativeRange"],
+            "DAILY_RELATIVE_RANGE_LAST_7_DAYS"
+        );
+    }
+
+    #[test]
+    fn parse_query_reports_invalid_json_clearly() {
+        let error = parse_query("sdfg").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .starts_with("data usage query must be valid JSON:"));
+    }
 }

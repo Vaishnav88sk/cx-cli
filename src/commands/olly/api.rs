@@ -178,10 +178,9 @@ pub struct OllyApi {
 }
 
 impl OllyApi {
-    /// Create a new OllyApi client.
-    pub fn new(endpoint: &str, api_key: &str, verbose: bool) -> Result<Self> {
-        let client = CxClient::new(endpoint, api_key, verbose)?;
-        Ok(Self { client })
+    /// Create an Olly API client from the configured shared HTTP client.
+    pub fn from_client(client: CxClient) -> Self {
+        Self { client }
     }
 
     // ── Chats ──────────────────────────────────────────────────────────────────
@@ -199,12 +198,21 @@ impl OllyApi {
             .await
     }
 
+    /// Send a message to an Olly chat.
+    ///
+    /// `agent_to_agent_mode` signals that the caller is an AI agent (not a
+    /// human): when `true`, Olly acts as a sub-agent - shorter responses, no
+    /// charts/tables, asks clarifying questions instead of guessing, and
+    /// relies on the parent agent's broader context. Defaults to `false` in
+    /// the CLI since `cx olly ask` is used directly by humans as well as by
+    /// agents; LLM/agent callers should pass `--agent-to-agent-mode` to opt in.
     pub async fn send_message(
         &self,
         chat_id: &str,
         content: &str,
         model_choice: &str,
         timeout_seconds: u32,
+        agent_to_agent_mode: bool,
     ) -> Result<Interaction> {
         let path = format!("{CHATS_BASE}/{chat_id}/interactions/");
         let body = json!({
@@ -212,7 +220,8 @@ impl OllyApi {
             "interaction_mode": "skill",
             "model_choice": model_choice,
             "should_block": true,
-            "timeout_seconds": timeout_seconds
+            "timeout_seconds": timeout_seconds,
+            "agent_to_agent_mode": agent_to_agent_mode
         });
         self.client
             .post_with_headers(&path, &body, &[INTERACTION_SOURCE_HEADER])

@@ -158,7 +158,7 @@ Use this skill to query and manage YourDomain resources using the `cx your-domai
 | `cx your-domain list` | List all items | `--name <filter>` |
 | `cx your-domain get <id>` | Get a single item by ID | - |
 
-**Output format:** append `-o json` or `-o agents` for machine-readable output.
+**Output format:** append `-o json` or `-o toon` for machine-readable output.
 
 **Multi-profile:** use `-p <profile>` (repeatable) to target multiple profiles.
 
@@ -233,7 +233,7 @@ cx command-b list -o json
 - **`cx-other-skill`** - description of relationship
 ```
 
-**Reference implementations:** `skills/cx-cost-optimization/SKILL.md` (5-command workflow) and `skills/cx-incident-management/SKILL.md` (multi-command orchestrator with cross-skill delegation).
+**Reference implementations:** `skills/cx-cost-optimization/SKILL.md` (5-command workflow) and `skills/cx-observability-setup/SKILL.md` (multi-command orchestrator with cross-skill delegation).
 
 ---
 
